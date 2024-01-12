@@ -11,70 +11,60 @@ import (
 
 const (
 	endpoint = `https://www.facebook.com/groups/900072927547214/`
-	scroll   = `
-        const scrolls = 50;
-
-        let scrollCount = 0;
-        const scrollInterval = setInterval(() => {
-            window.scrollTo(0, document.body.scrollHeight);
-            scrollCount++;
-
-            if (scrolls === numScrolls) {
-                clearInterval(scrollInterval);
-            }
-        }, 500);
-    `
 )
 
 func main() {
 	ctx, cancel := chromedp.NewContext(context.Background())
 	defer cancel()
 
-	// Create a timeout
-	// ctx, cancel = context.WithTimeout(ctx, 15*time.Second)
-	// defer cancel()
-
-	// navigate to a page, wait for an element, click
-	log.Println("Retrieving posts...")
-	var postNodes []*cdp.Node
+	log.Println("Closing login popup...")
 	err := chromedp.Run(ctx,
-		// Navigate to the FB page
+		// Navigate to the group page
 		chromedp.Navigate(endpoint),
-		// Wait for the login popup to appear, and close it
+		// Wait for the login popup to appear
 		chromedp.WaitVisible(`#login_popup_cta_form`, chromedp.ByQuery),
+		// Close the login popup
 		chromedp.Click(`[role="dialog"] > div > [role="button"]`, chromedp.ByQuery, chromedp.NodeVisible),
-		// Scroll the page
-		chromedp.Evaluate(scroll, nil),
-		chromedp.Sleep(25*time.Second),
-		// Retrieve all the visible post nodes
-		chromedp.Nodes(`[data-pagelet="GroupFeed"] > [role="feed"] [aria-posinset][role="article"]`, &postNodes, chromedp.ByQueryAll),
+		// Move the page to render it completely, this ensures that Facebook is able to 
+        // append a component into the feed section which is used as a breakpoint to load more posts
+		chromedp.Evaluate(`window.scrollTo(0, document.body.scrollHeight);`, nil),
 	)
 	if err != nil {
 		log.Fatal(err)
 	}
 
-	// TODO
-	// keep track of the last posinset found in the group feed
-	// scroll the page
-	// parse the nodes again, etc etc making sure to only add new nodes to the list
-	// update the posinset
-	// repeat
-
-	// parse the nodes collected to a struct
-	// for this one we can optimize this later on to basically run alongside with the parsing so not alot of nodes
-	// are stored in memory, and we don't need to maintain a list of nodes to parse
-
-	log.Println("Found posts: ", len(postNodes))
-	log.Println("Parsing content...")
-	var content string
-	for _, node := range postNodes {
+	log.Println("Retrieving posts...")
+	for i := 0; i < 5; i++ {
+		var posts []*cdp.Node
 		err = chromedp.Run(ctx,
-			chromedp.InnerHTML(`[data-ad-comet-preview="message"] span > div`, &content, chromedp.ByQuery, chromedp.FromNode(node)),
+			// Check if all posts have been loaded, for now we just wait 1 sec, there should be a better way to do this, maybe checking for a node that still is in shimmer
+			// TODO: Maybe there is a better way to check whether new items have been loaded into the DOM
+			chromedp.Sleep(3*time.Second),
+			// Get all the visible posts from the group feed
+			chromedp.Nodes(`[data-pagelet="GroupFeed"] > [role="feed"] [aria-posinset][role="article"]`, &posts, chromedp.ByQueryAll),
 		)
 		if err != nil {
 			log.Fatal(err)
 		}
 
-		log.Printf("Post content: %s", content)
+		var content string
+		for _, post := range posts {
+			err = chromedp.Run(ctx,
+				chromedp.InnerHTML(`[data-ad-comet-preview="message"] span`, &content, chromedp.ByQuery, chromedp.FromNode(post)),
+			)
+			if err != nil {
+				log.Fatal(err)
+			}
+
+			log.Printf("Post content: %s", content)
+		}
+
+		err = chromedp.Run(ctx,
+			// Remove the posts that have already been parsed from the dom
+			chromedp.Evaluate(`document.querySelectorAll('[data-pagelet="GroupFeed"] > [role="feed"] > div:nth-last-child(n+4)').forEach((n) => n.remove());`, nil),
+		)
+		if err != nil {
+			log.Fatal(err)
+		}
 	}
 }
