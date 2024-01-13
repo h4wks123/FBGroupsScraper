@@ -2,14 +2,18 @@ package main
 
 import (
 	"context"
+	"fmt"
 	"log"
+	"time"
 
 	"github.com/chromedp/cdproto/cdp"
 	"github.com/chromedp/chromedp"
 )
 
 const (
-	endpoint = `https://www.facebook.com/groups/900072927547214/`
+	endpoint = `https://www.facebook.com/groups`
+	groupID  = `900072927547214`
+	timeout  = 15
 )
 
 func main() {
@@ -23,44 +27,55 @@ func main() {
 	ctx, cancel := chromedp.NewContext(context.Background())
 	defer cancel()
 
+	log.Printf("Navigating to group page (id: %s)...\n", groupID)
+	if err := chromedp.Run(ctx, chromedp.Navigate(fmt.Sprintf("%s/%s/", endpoint, groupID))); err != nil {
+		log.Fatal(err)
+	}
+
 	log.Println("Closing login popup...")
-	var feedNodes []*cdp.Node
-	err := chromedp.Run(ctx,
-		// Navigate to the group page
-		chromedp.Navigate(endpoint),
-		// Wait for the login popup to appear
+	if err := chromedp.Run(ctx,
 		chromedp.WaitVisible(`#login_popup_cta_form`, chromedp.ByQuery),
-		// Close the login popup
 		chromedp.Click(`[role="dialog"] > div > [role="button"]`, chromedp.ByQuery, chromedp.NodeVisible),
+	); err != nil {
+		log.Fatal(err)
+	}
+
+	log.Println("Retrieving feed...")
+	var nodes []*cdp.Node
+	if err := chromedp.Run(ctx, chromedp.Nodes(`[data-pagelet="GroupFeed"] > [role="feed"]`, &nodes, chromedp.ByQuery)); err != nil {
+		log.Fatal(err)
+	}
+	if len(nodes) == 0 {
+		log.Fatal("error: unable to extract feed")
+	}
+	feed := nodes[0]
+
+	log.Println("Loading posts...")
+	if err := chromedp.Run(ctx,
 		// Removes a buffer element at the top of the feed, which is not really used
 		chromedp.Evaluate(`document.querySelector('[data-pagelet="GroupFeed"] > [role="feed"] > div:first-child').remove();`, nil),
 		// Move the page to render it completely, this ensures that Facebook is able to
 		// append a component into the feed section which is used as a breakpoint to load more posts
 		chromedp.Evaluate(`window.scrollTo(0, document.body.scrollHeight);`, nil),
-		// Retrieve the feed nodes
-		chromedp.Nodes(`[data-pagelet="GroupFeed"] > [role="feed"]`, &feedNodes, chromedp.ByQuery),
-	)
-	if err != nil {
+	); err != nil {
 		log.Fatal(err)
 	}
 
-	if len(feedNodes) == 0 {
-		log.Fatal("Could not find the feed element")
-	}
-
-	log.Println("Retrieving posts...")
-	feed := feedNodes[0]
+	log.Println("Extracting posts...")
+	var posts []*cdp.Node
 	for i := 0; i < 5; i++ {
-		var posts []*cdp.Node
-		err = chromedp.Run(ctx,
+        if err := chromedp.Run(ctx,
 			// Check if all content is loaded, at most 5 posts are loaded at a time
 			// along with 3 nodes for the next set of posts breakpoint, loading indicator, and a buffer element
-            // This also timesout automatically after 30 seconds
-			chromedp.Poll(`document.querySelector('[data-pagelet="GroupFeed"] > [role="feed"]').children.length >= 8`, nil, chromedp.WithPollingInFrame(feed), chromedp.WithPollingMutation()),
-			// Get all the visible lposts from the group feed
+			chromedp.Poll(`document.querySelector('[data-pagelet="GroupFeed"] > [role="feed"]').children.length >= 8`,
+				nil,
+				chromedp.WithPollingInFrame(feed),
+				chromedp.WithPollingMutation(),
+				chromedp.WithPollingTimeout(timeout*time.Second),
+			),
+			// Get all the visible posts from the group feed
 			chromedp.Nodes(`[aria-posinset][role="article"]`, &posts, chromedp.ByQueryAll, chromedp.FromNode(feed)),
-		)
-		if err != nil {
+		); err != nil {
 			log.Fatal(err)
 		}
 
@@ -75,21 +90,19 @@ func main() {
 		// thus the only thing I need are the images, the locations, and optionally the name of the snakes
 		var content string
 		for _, post := range posts {
-			err = chromedp.Run(ctx,
+			if err := chromedp.Run(ctx,
 				chromedp.InnerHTML(`[data-ad-comet-preview="message"] span`, &content, chromedp.ByQuery, chromedp.FromNode(post)),
-			)
-			if err != nil {
+			); err != nil {
 				log.Fatal(err)
 			}
 
 			log.Printf("Post content: %s", content)
 		}
 
-		err = chromedp.Run(ctx,
+		if err := chromedp.Run(ctx,
 			// Remove the posts that have already been parsed from the dom
-			chromedp.Evaluate(`document.querySelectorAll('[data-pagelet="GroupFeed"] > [role="feed"] > div:nth-last-child(n+4)').forEach((n) => n.remove());`, nil),
-		)
-		if err != nil {
+			chromedp.Evaluate(`document.querySelectorAll('[data-pagelet="GroupFeed"] > [role="feed"] div:nth-last-child(n+4)').forEach((n) => n.remove());`, nil),
+		); err != nil {
 			log.Fatal(err)
 		}
 	}
