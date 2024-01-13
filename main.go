@@ -27,41 +27,13 @@ func main() {
 	ctx, cancel := chromedp.NewContext(context.Background())
 	defer cancel()
 
-	log.Printf("Navigating to group page (id: %s)...\n", groupID)
-	if err := chromedp.Run(ctx, chromedp.Navigate(fmt.Sprintf("%s/%s/", endpoint, groupID))); err != nil {
+	log.Println("Retrieving facebook group...")
+	feed, err := getFacebookGroupFeed(ctx, groupID)
+	if err != nil {
 		log.Fatal(err)
 	}
 
-	log.Println("Closing login popup...")
-	if err := chromedp.Run(ctx,
-		chromedp.WaitVisible(`#login_popup_cta_form`, chromedp.ByQuery),
-		chromedp.Click(`[role="dialog"] > div > [role="button"]`, chromedp.ByQuery, chromedp.NodeVisible),
-	); err != nil {
-		log.Fatal(err)
-	}
-
-	log.Println("Retrieving feed...")
-	var nodes []*cdp.Node
-	if err := chromedp.Run(ctx, chromedp.Nodes(`[data-pagelet="GroupFeed"] > [role="feed"]`, &nodes, chromedp.ByQuery)); err != nil {
-		log.Fatal(err)
-	}
-	if len(nodes) == 0 {
-		log.Fatal("error: unable to extract feed")
-	}
-	feed := nodes[0]
-
-	log.Println("Loading posts...")
-	if err := chromedp.Run(ctx,
-		// Removes a buffer element at the top of the feed, which is not really used
-		chromedp.Evaluate(`document.querySelector('[data-pagelet="GroupFeed"] > [role="feed"] > div:first-child').remove();`, nil),
-		// Move the page to render it completely, this ensures that Facebook is able to
-		// append a component into the feed section which is used as a breakpoint to load more posts
-		chromedp.Evaluate(`window.scrollTo(0, document.body.scrollHeight);`, nil),
-	); err != nil {
-		log.Fatal(err)
-	}
-
-	log.Println("Extracting posts...")
+	log.Println("Retrieving posts...")
 	var posts []*cdp.Node
 	for i := 0; i < 5; i++ {
         if err := chromedp.Run(ctx,
@@ -108,4 +80,30 @@ func main() {
 	}
 
 	// TODO: Priority 3: Potential end of page reached, check what it looks like, and how to handle it
+}
+
+func getFacebookGroupFeed(c context.Context, groupID string) (*cdp.Node, error) {
+	var nodes []*cdp.Node
+	tasks := chromedp.Tasks{
+		// Navigate to page
+		chromedp.Navigate(fmt.Sprintf("%s/%s/", endpoint, groupID)),
+		// Wait for the login popup to appear
+		chromedp.WaitVisible(`#login_popup_cta_form`, chromedp.ByQuery),
+		// Close the login popup
+		chromedp.Click(`[role="dialog"] > div > [role="button"]`, chromedp.ByQuery, chromedp.NodeVisible),
+		// Retrieve the feed
+		chromedp.Nodes(`[data-pagelet="GroupFeed"] > [role="feed"]`, &nodes, chromedp.ByQuery),
+		// Removes a buffer element at the top of the feed, which is not really used
+		chromedp.Evaluate(`document.querySelector('[data-pagelet="GroupFeed"] > [role="feed"] > div:first-child')?.remove();`, nil),
+		// Move the page to render the post breakpoint for loading new set of posts
+		chromedp.Evaluate(`window.scrollTo(0, document.body.scrollHeight);`, nil),
+	}
+
+	if err := chromedp.Run(c, tasks...); err != nil {
+		return nil, err
+	} else if len(nodes) == 0 {
+		return nil, fmt.Errorf("error: unable to extract feed")
+	}
+
+	return nodes[0], nil
 }
