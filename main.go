@@ -2,10 +2,13 @@ package main
 
 import (
 	"context"
+	"encoding/csv"
+	"errors"
 	"fmt"
 	"log"
 	"net/url"
-	"path"
+	"os"
+	"path/filepath"
 	"regexp"
 	"strings"
 	"time"
@@ -15,14 +18,20 @@ import (
 )
 
 const (
-	endpoint   = `https://www.facebook.com/groups`
-	groupID    = `900072927547214`
-	timeout    = 5
-	maxRetries = 5
-	maxPosts   = 10 // this is just a min bound, the actual number of posts scraped may be higher than this
+	endpoint        = `https://www.facebook.com/groups`
+	groupID         = `900072927547214`
+	postsFile       = "posts.csv"
+	attachmentsFile = "attachments.csv"
+	timeout         = 5
+	maxRetries      = 5
+	maxPosts        = 10 // this is just a min bound, the actual number of posts scraped may be higher than this
 )
 
-var locationRegex = regexp.MustCompile(`(?i)loc(?:ation)?(?:.*?)([^ation]\w[\w\ \,]+)`)
+var (
+	locationRegex        = regexp.MustCompile(`(?i)loc(?:ation)?(?:.*?)([^ation]\w[\w\ \,]+)`)
+	LoginBypassFailed    = errors.New("error: unable to bypass redirect to login page")
+	UnableToRetrieveFeed = errors.New("error: unable to retrieve feed")
+)
 
 type Post struct {
 	ID       string
@@ -36,8 +45,31 @@ func main() {
 	// Rate limit to limit the number of parses per second
 	// Output folder to save the images to
 	// Filenames for the csvs
-    os.
+	file, err := os.Create(postsFile)
+	if err != nil {
+		log.Fatal(err)
+	}
+	defer file.Close()
 
+	postWriter := csv.NewWriter(file)
+	defer postWriter.Flush()
+
+	if err := postWriter.Write([]string{"id", "location", "content"}); err != nil {
+		log.Fatal(err)
+	}
+
+	file, err = os.Create(attachmentsFile)
+	if err != nil {
+		log.Fatal(err)
+	}
+	defer file.Close()
+
+	attachmentsWriter := csv.NewWriter(file)
+	defer attachmentsWriter.Flush()
+
+	if err := attachmentsWriter.Write([]string{"id", "image"}); err != nil {
+		log.Fatal(err)
+	}
 
 	opts := append(chromedp.DefaultExecAllocatorOptions[:], chromedp.Flag("headless", false))
 	browser, close := chromedp.NewExecAllocator(context.Background(), opts...)
@@ -96,7 +128,15 @@ func main() {
 				continue
 			}
 
-			log.Printf("%#v\n", post)
+			if err := postWriter.Write([]string{post.ID, fmt.Sprintf("%s", post.Location), fmt.Sprintf("%s", strings.ReplaceAll(post.Content, `"`, `'`))}); err != nil {
+				log.Fatal(err)
+			}
+
+			for _, image := range post.Images {
+				if err := attachmentsWriter.Write([]string{post.ID, image}); err != nil {
+					log.Fatal(err)
+				}
+			}
 		}
 
 		retries = 0
@@ -117,7 +157,7 @@ func extractPost(postNode *cdp.Node, ctx context.Context) (*Post, error) {
 		// Get Post Content
 		chromedp.Evaluate(extractPostContentJS(postNode.FullXPath()), &content),
 		// Get Post Image Links
-		chromedp.Nodes(`a[role="link"]`, &aNodes, chromedp.ByQueryAll, chromedp.FromNode(postNode)),
+		chromedp.Nodes(`a[role="link"]:has(img)`, &aNodes, chromedp.ByQueryAll, chromedp.FromNode(postNode)),
 		// Get Post Images
 		chromedp.Nodes(`img[src*="fna.fbcdn.net"]`, &imageNodes, chromedp.ByQueryAll, chromedp.FromNode(postNode)),
 	); err != nil {
@@ -151,8 +191,7 @@ func extractPost(postNode *cdp.Node, ctx context.Context) (*Post, error) {
 			continue
 		}
 
-		_, filename := path.Split(imgUrl.Path)
-		post.Images = append(post.Images, filename)
+		post.Images = append(post.Images, filepath.Base(imgUrl.Path))
 	}
 
 	return post, nil
@@ -199,23 +238,26 @@ func trackNodeStabilityJS(xpath, label string, debounce time.Duration) string {
 func navigateWithBypass(url string, sleep time.Duration, retries int) chromedp.ActionFunc {
 	return func(ctx context.Context) error {
 		var navigatedUrl string
-		tasks := chromedp.Tasks{
+
+		if err := chromedp.Run(ctx,
 			chromedp.Navigate(url),
 			chromedp.Location(&navigatedUrl),
-		}
-
-		if err := chromedp.Run(ctx, tasks); err != nil {
+		); err != nil {
 			return err
 		}
 
 		for i := 0; navigatedUrl != url && i < retries; i++ {
-			if err := chromedp.Run(ctx, chromedp.Sleep(sleep), tasks); err != nil {
+			if err := chromedp.Run(ctx,
+				chromedp.Sleep(sleep),
+				chromedp.Navigate(url),
+				chromedp.Location(&navigatedUrl),
+			); err != nil {
 				return err
 			}
 		}
 
 		if navigatedUrl != url {
-			return fmt.Errorf("error: unable to bypass redirect to login page")
+			return LoginBypassFailed
 		}
 
 		return nil
@@ -241,7 +283,7 @@ func getFacebookGroupFeed(ctx context.Context, groupID string) (*cdp.Node, error
 	); err != nil {
 		return nil, err
 	} else if len(nodes) == 0 {
-		return nil, fmt.Errorf("error: unable to extract feed")
+		return nil, UnableToRetrieveFeed
 	}
 
 	return nodes[0], nil
