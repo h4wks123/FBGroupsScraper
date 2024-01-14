@@ -12,10 +12,12 @@ import (
 	"os"
 	"path/filepath"
 	"regexp"
+	"runtime"
 	"strings"
 	"sync"
 	"time"
 
+	"github.com/LaplaceXD/FBGroupsScraper/scripts"
 	"github.com/chromedp/cdproto/cdp"
 	"github.com/chromedp/chromedp"
 )
@@ -28,52 +30,8 @@ const (
 	imagesDir       = "images"
 	timeout         = 5
 	maxRetries      = 5
-	maxPosts        = 10 // this is just a min bound, the actual number of posts scraped may be higher than this
+	maxPosts        = 30 // this is just a min bound, the actual number of posts scraped may be higher than this
 )
-
-const trackNodeStabilityScript = `
-function trackNodeStability(xpath, label, debounce) {
-    window.stable = window.stable || {};
-    let node = document.evaluate(xpath, document, null, XPathResult.FIRST_ORDERED_NODE_TYPE, null)?.singleNodeValue;
-
-    if(node) {
-        window.stable[label] = window.stable[label] || {};
-        window.stable[label].observer = new MutationObserver(function() {
-            window.stable[label].value = false;
-
-            clearTimeout(window.stable[label].timeout);
-            window.stable[label].timeout = setTimeout(() => window.stable[label].value = true, debounce);
-        });
-
-        window.stable[label].observer.observe(node, { childList: true });
-    }
-}
-`
-
-func trackNodeStabilityJS(node *cdp.Node, label string, debounce time.Duration) string {
-	return fmt.Sprintf(`trackNodeStability("%s", "%s", %d)`, node.FullXPath(), label, debounce.Milliseconds())
-}
-
-const extractPostContentScript = `
-function extractPostContent(xpath) {
-    let text = "";
-    const content = document
-        .evaluate(xpath, document, null, XPathResult.FIRST_ORDERED_NODE_TYPE, null)
-        ?.singleNodeValue
-        ?.querySelector("[data-ad-preview='message']");
-
-    if (content) {
-        const walker = document.createTreeWalker(content, NodeFilter.SHOW_TEXT); 
-        while(walker.nextNode()) text += walker.currentNode.textContent + "\n";
-    }
-
-    return text;
-}
-`
-
-func extractPostContentJS(node *cdp.Node) string {
-	return fmt.Sprintf(`extractPostContent("%s");`, node.FullXPath())
-}
 
 var (
 	locationRegex    = regexp.MustCompile(`(?i)loc(?:ation)?(?:.*?)([^ation]\w[\w\ \,]+)`)
@@ -133,7 +91,7 @@ func main() {
 		log.Fatal(err)
 	}
 
-	for i := 1; i <= 6; i++ {
+	for i := 1; i <= runtime.GOMAXPROCS(0)-3; i++ {
 		wg.Add(1)
 		go func(imgs <-chan Image, wg *sync.WaitGroup) {
 			defer wg.Done()
@@ -195,8 +153,6 @@ func main() {
 					log.Println(err)
 					continue
 				}
-
-				imgChan <- img
 			}
 		}
 	}(postReplicaChan, &wg)
@@ -215,9 +171,9 @@ func main() {
 	}
 
 	if err := chromedp.Run(ctx,
-		loadScripts(trackNodeStabilityScript, extractPostContentScript),
+		loadScripts(scripts.All()...),
 		// Track the feed for stability (i.e., no changes have occured to its children after a period of time)
-		chromedp.Evaluate(trackNodeStabilityJS(feed, "feed", time.Second), nil),
+		chromedp.Evaluate(scripts.TrackStability(feed.FullXPath(), "feed", time.Second), nil),
 	); err != nil {
 		log.Fatal(err)
 	}
@@ -225,10 +181,9 @@ func main() {
 	log.Println("Retrieving posts...")
 	var retries, postsScraped int
 	var postNodes []*cdp.Node
-	for postsScraped <= maxPosts {
+	for postsScraped < maxPosts {
 		if err := chromedp.Run(ctx,
-			// Wait for the feed to become stable
-			chromedp.Poll(`window.stable.feed.value`, nil),
+			chromedp.Poll(scripts.CheckStability("feed"), nil),
 			// Expand all content
 			chromedp.Evaluate(`document.querySelectorAll('[data-ad-preview="message"] div:last-child[role="button"]').forEach((n)=> n.click())`, nil),
 			// Retrieve the posts that have images
@@ -263,6 +218,10 @@ func main() {
 
 			postChan <- post
 			postReplicaChan <- post
+
+			for _, img := range post.Images {
+				imgChan <- img
+			}
 		}
 
 		retries = 0
@@ -272,6 +231,8 @@ func main() {
 		); err != nil {
 			log.Fatal(err)
 		}
+
+		log.Printf("Scraped %d posts\n", postsScraped)
 	}
 
 	close(imgChan)
@@ -286,7 +247,7 @@ func extractPost(postNode *cdp.Node, ctx context.Context) (*Post, error) {
 
 	if err := chromedp.Run(ctx,
 		// Get Post Content
-		chromedp.Evaluate(extractPostContentJS(postNode), &content),
+		chromedp.Evaluate(scripts.ExtractAllText(postNode.FullXPath(), "[data-ad-preview='message']"), &content),
 		// Get Post Image Links
 		chromedp.Nodes(`a[role="link"]:has(img)`, &aNodes, chromedp.ByQueryAll, chromedp.FromNode(postNode)),
 		// Get Post Images

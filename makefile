@@ -4,4 +4,4 @@ run: build
 	@./bin/scrape
 
 build:
-	@go build -o bin/scrape main.go
+	@go build -o bin/scrape .

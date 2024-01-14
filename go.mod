@@ -3,8 +3,11 @@ module github.com/LaplaceXD/FBGroupsScraper
 go 1.21.5
 
 require (
-	github.com/chromedp/cdproto v0.0.0-20240102194822-c006b26f21c7 // indirect
-	github.com/chromedp/chromedp v0.9.3 // indirect
+	github.com/chromedp/cdproto v0.0.0-20240102194822-c006b26f21c7
+	github.com/chromedp/chromedp v0.9.3
+)
+
+require (
 	github.com/chromedp/sysutil v1.0.0 // indirect
 	github.com/gobwas/httphead v0.1.0 // indirect
 	github.com/gobwas/pool v0.2.1 // indirect
