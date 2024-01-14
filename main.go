@@ -17,7 +17,7 @@ import (
 const (
 	endpoint   = `https://www.facebook.com/groups`
 	groupID    = `900072927547214`
-	timeout    = 15
+	timeout    = 5
 	maxRetries = 5
 	maxPosts   = 10 // this is just a min bound, the actual number of posts scraped may be higher than this
 )
@@ -36,13 +36,15 @@ func main() {
 	// Rate limit to limit the number of parses per second
 	// Output folder to save the images to
 	// Filenames for the csvs
+    os.
+
 
 	opts := append(chromedp.DefaultExecAllocatorOptions[:], chromedp.Flag("headless", false))
-	browserCtx, closeBrowser := chromedp.NewExecAllocator(context.Background(), opts...)
-	defer closeBrowser()
+	browser, close := chromedp.NewExecAllocator(context.Background(), opts...)
+	defer close()
 
-	ctx, cancel := chromedp.NewContext(browserCtx)
-	defer cancel()
+	ctx, close := chromedp.NewContext(browser)
+	defer close()
 
 	log.Println("Retrieving facebook group...")
 	feed, err := getFacebookGroupFeed(ctx, groupID)
@@ -61,13 +63,16 @@ func main() {
 	for postsScraped <= maxPosts {
 		if err := chromedp.Run(ctx,
 			// Wait for the feed to become stable
-			chromedp.Poll(`window.stable.feed.value`, nil, chromedp.WithPollingTimeout(timeout*time.Second)),
+			chromedp.Poll(`window.stable.feed.value`, nil),
 			// Expand all content
 			chromedp.Evaluate(`document.querySelectorAll('[data-ad-preview="message"] div:last-child[role="button"]').forEach((n)=> n.click())`, nil),
 			// Retrieve the posts that have images
-			runTasksWithTimeout(5*time.Second,
-				chromedp.Nodes(`[aria-posinset][role="article"] div:nth-child(3):has(img[src*="fna.fbcdn.net"])`, &postNodes, chromedp.ByQueryAll, chromedp.FromNode(feed)),
-			),
+			chromedp.ActionFunc(func(ctx context.Context) error {
+				timeoutCtx, close := context.WithTimeout(ctx, timeout*time.Second)
+				defer close()
+
+				return chromedp.Nodes(`[aria-posinset][role="article"] div:nth-child(3):has(img[src*="fna.fbcdn.net"])`, &postNodes, chromedp.ByQueryAll, chromedp.FromNode(feed)).Do(timeoutCtx)
+			}),
 		); err != nil {
 			if err != context.DeadlineExceeded || retries >= maxRetries {
 				log.Fatal(err)
@@ -82,7 +87,7 @@ func main() {
 		}
 
 		// create a channel, to receive the image links, and then delegate it to goroutines, so it runs in the background
-		postsScraped = postsScraped + len(postNodes)
+		postsScraped += len(postNodes)
 		for _, postNode := range postNodes {
 			post, err := extractPost(postNode, ctx)
 			if err != nil {
@@ -91,7 +96,7 @@ func main() {
 				continue
 			}
 
-			log.Printf("%+v\n", post)
+			log.Printf("%#v\n", post)
 		}
 
 		retries = 0
@@ -191,34 +196,20 @@ func trackNodeStabilityJS(xpath, label string, debounce time.Duration) string {
     `, xpath, label, label, label, label, label, label, label, debounce.Milliseconds(), label)
 }
 
-func runTasksWithTimeout(timeout time.Duration, tasks ...chromedp.Action) chromedp.ActionFunc {
-	return func(ctx context.Context) error {
-		timeoutCtx, cancel := context.WithTimeout(ctx, timeout)
-		defer cancel()
-
-		return chromedp.Tasks(tasks).Do(timeoutCtx)
-	}
-}
-
 func navigateWithBypass(url string, sleep time.Duration, retries int) chromedp.ActionFunc {
 	return func(ctx context.Context) error {
 		var navigatedUrl string
-
-		err := chromedp.Tasks{
+		tasks := chromedp.Tasks{
 			chromedp.Navigate(url),
 			chromedp.Location(&navigatedUrl),
-		}.Do(ctx)
-		if err != nil {
+		}
+
+		if err := chromedp.Run(ctx, tasks); err != nil {
 			return err
 		}
 
 		for i := 0; navigatedUrl != url && i < retries; i++ {
-			err := chromedp.Tasks{
-				chromedp.Sleep(sleep),
-				chromedp.Navigate(url),
-				chromedp.Location(&navigatedUrl),
-			}.Do(ctx)
-			if err != nil {
+			if err := chromedp.Run(ctx, chromedp.Sleep(sleep), tasks); err != nil {
 				return err
 			}
 		}
@@ -231,10 +222,10 @@ func navigateWithBypass(url string, sleep time.Duration, retries int) chromedp.A
 	}
 }
 
-func getFacebookGroupFeed(c context.Context, groupID string) (*cdp.Node, error) {
+func getFacebookGroupFeed(ctx context.Context, groupID string) (*cdp.Node, error) {
 	var nodes []*cdp.Node
 
-	tasks := chromedp.Tasks{
+	if err := chromedp.Run(ctx,
 		// Bypass Facebook's redirect to the Login page
 		navigateWithBypass(fmt.Sprintf("%s/%s/", endpoint, groupID), 5*time.Second, 3),
 		// Wait for the login popup to appear
@@ -247,9 +238,7 @@ func getFacebookGroupFeed(c context.Context, groupID string) (*cdp.Node, error) 
 		chromedp.Evaluate(`document.querySelector('[data-pagelet="GroupFeed"] > [role="feed"] > div:first-child')?.remove();`, nil),
 		// Move the page to render the post breakpoint for loading new set of posts
 		chromedp.Evaluate(`window.scrollTo(0, document.body.scrollHeight);`, nil),
-	}
-
-	if err := chromedp.Run(c, tasks...); err != nil {
+	); err != nil {
 		return nil, err
 	} else if len(nodes) == 0 {
 		return nil, fmt.Errorf("error: unable to extract feed")
