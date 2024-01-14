@@ -25,7 +25,7 @@ const (
 var locationRegex = regexp.MustCompile(`(?i)loc(?:ation)?(?:.*?)([^ation]\w[\w\ \,]+)`)
 
 type Post struct {
-	ID       int64
+	ID       string
 	Location string
 	Content  string
 	Images   []string
@@ -56,10 +56,8 @@ func main() {
 	}
 
 	log.Println("Retrieving posts...")
-	var retries, postsScraped int64
-	var postNodes, imageNodes []*cdp.Node
-
-	data := Post{Images: make([]string, 0)}
+	var retries, postsScraped int
+	var postNodes []*cdp.Node
 	for postsScraped <= maxPosts {
 		if err := chromedp.Run(ctx,
 			// Wait for the feed to become stable
@@ -84,34 +82,16 @@ func main() {
 		}
 
 		// create a channel, to receive the image links, and then delegate it to goroutines, so it runs in the background
-		for _, post := range postNodes {
-			postsScraped = postsScraped + 1
-			data.ID = postsScraped
-
-			if err := chromedp.Run(ctx, getAllTextContentInNode(post.FullXPath(), &data.Content)); err != nil {
-				log.Print(err)
+		postsScraped = postsScraped + len(postNodes)
+		for _, postNode := range postNodes {
+			post, err := extractPost(postNode, ctx)
+			if err != nil {
+				postsScraped -= 1
+				log.Println(err)
 				continue
 			}
 
-			data.Location = extractPostLocation(data.Content)
-			if err := chromedp.Run(ctx, chromedp.Nodes(`img[src*="fna.fbcdn.net"]`, &imageNodes, chromedp.ByQueryAll, chromedp.FromNode(post))); err != nil {
-				log.Print(err)
-				continue
-			}
-
-			data.Images = data.Images[:0]
-			for _, img := range imageNodes {
-				imgUrl, err := url.Parse(img.AttributeValue("src"))
-				if err != nil {
-					log.Print(err)
-					continue
-				}
-
-				_, filename := path.Split(imgUrl.Path)
-				data.Images = append(data.Images, filename)
-			}
-
-			fmt.Printf("%+v\n", data)
+			log.Printf("%+v\n", post)
 		}
 
 		retries = 0
@@ -124,16 +104,53 @@ func main() {
 	}
 }
 
-func extractPostLocation(content string) string {
+func extractPost(postNode *cdp.Node, ctx context.Context) (*Post, error) {
+	var aNodes, imageNodes []*cdp.Node
+	var content, location string
+
+	if err := chromedp.Run(ctx,
+		// Get Post Content
+		getAllTextContentInNode(postNode.FullXPath(), &content),
+		// Get Post Image Links
+		chromedp.Nodes(`a[role="link"]`, &aNodes, chromedp.ByQueryAll, chromedp.FromNode(postNode)),
+		// Get Post Images
+		chromedp.Nodes(`img[src*="fna.fbcdn.net"]`, &imageNodes, chromedp.ByQueryAll, chromedp.FromNode(postNode)),
+	); err != nil {
+		return nil, err
+	}
+
+	postUrl, err := url.Parse(aNodes[0].AttributeValue("href"))
+	if err != nil {
+		return nil, err
+	}
+
 	if strings.Contains(strings.ToLower(content), "loc") {
 		for _, line := range strings.Split(content, "\n") {
 			if match := locationRegex.FindStringSubmatch(line); len(match) > 1 {
-				return strings.TrimSpace(match[1])
+				location = strings.TrimSpace(match[1])
+				break
 			}
 		}
 	}
 
-	return ""
+	post := &Post{
+		ID:       strings.TrimPrefix(strings.TrimPrefix(postUrl.Query().Get("set"), "pcb."), "gm."),
+		Location: location,
+		Content:  content,
+		Images:   make([]string, 0, len(imageNodes)),
+	}
+
+	for _, img := range imageNodes {
+		imgUrl, err := url.Parse(img.AttributeValue("src"))
+		if err != nil {
+			continue
+		}
+
+		_, filename := path.Split(imgUrl.Path)
+		post.Images = append(post.Images, filename)
+	}
+
+	return post, nil
 }
 
 func getAllTextContentInNode(xpath string, contentRef *string) chromedp.Action {
