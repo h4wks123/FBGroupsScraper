@@ -31,6 +31,50 @@ const (
 	maxPosts        = 10 // this is just a min bound, the actual number of posts scraped may be higher than this
 )
 
+const trackNodeStabilityScript = `
+function trackNodeStability(xpath, label, debounce) {
+    window.stable = window.stable || {};
+    let node = document.evaluate(xpath, document, null, XPathResult.FIRST_ORDERED_NODE_TYPE, null)?.singleNodeValue;
+
+    if(node) {
+        window.stable[label] = window.stable[label] || {};
+        window.stable[label].observer = new MutationObserver(function() {
+            window.stable[label].value = false;
+
+            clearTimeout(window.stable[label].timeout);
+            window.stable[label].timeout = setTimeout(() => window.stable[label].value = true, debounce);
+        });
+
+        window.stable[label].observer.observe(node, { childList: true });
+    }
+}
+`
+
+func trackNodeStabilityJS(node *cdp.Node, label string, debounce time.Duration) string {
+	return fmt.Sprintf(`trackNodeStability("%s", "%s", %d)`, node.FullXPath(), label, debounce.Milliseconds())
+}
+
+const extractPostContentScript = `
+function extractPostContent(xpath) {
+    let text = "";
+    const content = document
+        .evaluate(xpath, document, null, XPathResult.FIRST_ORDERED_NODE_TYPE, null)
+        ?.singleNodeValue
+        ?.querySelector("[data-ad-preview='message']");
+
+    if (content) {
+        const walker = document.createTreeWalker(content, NodeFilter.SHOW_TEXT); 
+        while(walker.nextNode()) text += walker.currentNode.textContent + "\n";
+    }
+
+    return text;
+}
+`
+
+func extractPostContentJS(node *cdp.Node) string {
+	return fmt.Sprintf(`extractPostContent("%s");`, node.FullXPath())
+}
+
 var (
 	locationRegex    = regexp.MustCompile(`(?i)loc(?:ation)?(?:.*?)([^ation]\w[\w\ \,]+)`)
 	BypassFailed     = errors.New("error: unable to bypass redirect")
@@ -83,7 +127,7 @@ func main() {
 	var wg sync.WaitGroup
 	imgChan := make(chan Image, 64)
 	postChan := make(chan *Post, 32)
-	imgsChan := make(chan *Post, 32)
+	postReplicaChan := make(chan *Post, 32)
 
 	if err := os.MkdirAll(imagesDir, os.ModePerm); err != nil {
 		log.Fatal(err)
@@ -91,10 +135,10 @@ func main() {
 
 	for i := 1; i <= 6; i++ {
 		wg.Add(1)
-		go func(imgChan <-chan Image, wg *sync.WaitGroup) {
+		go func(imgs <-chan Image, wg *sync.WaitGroup) {
 			defer wg.Done()
 
-			for img := range imgChan {
+			for img := range imgs {
 				if err := img.Download(filepath.Join(imagesDir, img.Name)); err != nil {
 					log.Println(err)
 					continue
@@ -104,7 +148,7 @@ func main() {
 	}
 
 	wg.Add(1)
-	go func(postChan <-chan *Post, wg *sync.WaitGroup) {
+	go func(posts <-chan *Post, wg *sync.WaitGroup) {
 		defer wg.Done()
 
 		file, err := os.Create(postsFile)
@@ -129,7 +173,7 @@ func main() {
 	}(postChan, &wg)
 
 	wg.Add(1)
-	go func(imgsChan <-chan *Post, wg *sync.WaitGroup) {
+	go func(posts <-chan *Post, wg *sync.WaitGroup) {
 		defer wg.Done()
 
 		file, err := os.Create(attachmentsFile)
@@ -145,7 +189,7 @@ func main() {
 			log.Fatal(err)
 		}
 
-		for post := range imgsChan {
+		for post := range posts {
 			for _, img := range post.Images {
 				if err := attachmentsWriter.Write([]string{post.ID, img.Name}); err != nil {
 					log.Println(err)
@@ -155,7 +199,7 @@ func main() {
 				imgChan <- img
 			}
 		}
-	}(imgsChan, &wg)
+	}(postReplicaChan, &wg)
 
 	opts := append(chromedp.DefaultExecAllocatorOptions[:], chromedp.Flag("headless", false))
 	browser, cancel := chromedp.NewExecAllocator(context.Background(), opts...)
@@ -170,8 +214,11 @@ func main() {
 		log.Fatal(err)
 	}
 
-	// Track the feed for stability (i.e., no changes have occured to its children after a period of time)
-	if err := chromedp.Run(ctx, chromedp.Evaluate(trackNodeStabilityJS(feed.FullXPath(), "feed", time.Second), nil)); err != nil {
+	if err := chromedp.Run(ctx,
+		loadScripts(trackNodeStabilityScript, extractPostContentScript),
+		// Track the feed for stability (i.e., no changes have occured to its children after a period of time)
+		chromedp.Evaluate(trackNodeStabilityJS(feed, "feed", time.Second), nil),
+	); err != nil {
 		log.Fatal(err)
 	}
 
@@ -215,7 +262,7 @@ func main() {
 			}
 
 			postChan <- post
-			imgsChan <- post
+			postReplicaChan <- post
 		}
 
 		retries = 0
@@ -229,7 +276,7 @@ func main() {
 
 	close(imgChan)
 	close(postChan)
-	close(imgsChan)
+	close(postReplicaChan)
 	wg.Wait()
 }
 
@@ -239,7 +286,7 @@ func extractPost(postNode *cdp.Node, ctx context.Context) (*Post, error) {
 
 	if err := chromedp.Run(ctx,
 		// Get Post Content
-		chromedp.Evaluate(extractPostContentJS(postNode.FullXPath()), &content),
+		chromedp.Evaluate(extractPostContentJS(postNode), &content),
 		// Get Post Image Links
 		chromedp.Nodes(`a[role="link"]:has(img)`, &aNodes, chromedp.ByQueryAll, chromedp.FromNode(postNode)),
 		// Get Post Images
@@ -284,42 +331,14 @@ func extractPost(postNode *cdp.Node, ctx context.Context) (*Post, error) {
 	return post, nil
 }
 
-func extractPostContentJS(xpath string) string {
-	return fmt.Sprintf(`
-        (function() {
-            let text = "";
-            const content = document
-                .evaluate("%s", document, null, XPathResult.FIRST_ORDERED_NODE_TYPE, null)
-                ?.singleNodeValue
-                ?.querySelector("[data-ad-preview='message']");
+func loadScripts(scripts ...string) chromedp.ActionFunc {
+	return func(ctx context.Context) error {
+		if err := chromedp.Run(ctx, chromedp.Evaluate(strings.Join(scripts, "\n"), nil)); err != nil {
+			return err
+		}
 
-            if (content) {
-                const walker = document.createTreeWalker(content, NodeFilter.SHOW_TEXT); 
-                while(walker.nextNode()) text += walker.currentNode.textContent + "\n";
-            }
-
-            return text
-        })()
-    `, xpath)
-}
-
-func trackNodeStabilityJS(xpath, label string, debounce time.Duration) string {
-	return fmt.Sprintf(`
-        window.stable = window.stable || {};
-        let node = document.evaluate("%s", document, null, XPathResult.FIRST_ORDERED_NODE_TYPE, null)?.singleNodeValue;
-
-        if(node) {
-            window.stable["%s"] = window.stable["%s"] || {};
-            window.stable["%s"].observer = new MutationObserver(function() {
-                window.stable["%s"].value = false;
-
-                clearTimeout(window.stable["%s"].timeout);
-                window.stable["%s"].timeout = setTimeout(() => window.stable["%s"].value = true, %d);
-            });
-
-            window.stable["%s"].observer.observe(node, { childList: true });
-        }
-    `, xpath, label, label, label, label, label, label, label, debounce.Milliseconds(), label)
+		return nil
+	}
 }
 
 func navigateWithBypass(url string, sleep time.Duration, retries int) chromedp.ActionFunc {
