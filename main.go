@@ -60,6 +60,8 @@ func main() {
 		if err := chromedp.Run(ctx,
 			// Wait for the feed to become stable
 			chromedp.Poll(`window.stable.feed.value`, nil, chromedp.WithPollingTimeout(timeout*time.Second)),
+			// Expand all content
+			chromedp.Evaluate(`document.querySelectorAll('[data-ad-preview="message"] div:last-child[role="button"]').forEach((n)=> n.click())`, nil),
 			// Retrieve the posts that have images
 			runTasksWithTimeout(5*time.Second, chromedp.Tasks{
 				chromedp.Nodes(`[aria-posinset][role="article"] div:nth-child(3):has(img[src*="fna.fbcdn.net"])`, &postNodes, chromedp.ByQueryAll, chromedp.FromNode(feed)),
@@ -115,7 +117,7 @@ func main() {
 		retries = 0
 		// Remove the posts that have been processed
 		if err := chromedp.Run(ctx,
-			chromedp.Evaluate(`document.querySelectorAll('[data-pagelet="GroupFeed"] > [role="feed"] > div:nth-last-child(n+4)').forEach((n) => n?.remove());`, nil),
+			chromedp.Evaluate(`document.querySelectorAll('[data-pagelet="GroupFeed"] > [role="feed"] > div:nth-last-child(n+4)').forEach((n) => n.remove());`, nil),
 		); err != nil {
 			log.Fatal(err)
 		}
