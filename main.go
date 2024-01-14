@@ -13,6 +13,7 @@ import (
 	"path/filepath"
 	"regexp"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/chromedp/cdproto/cdp"
@@ -79,43 +80,89 @@ func main() {
 	// Rate limit to limit the number of parses per second
 	// Output folder to save the images to
 	// Filenames for the csvs
-
-	file, err := os.Create(postsFile)
-	if err != nil {
-		log.Fatal(err)
-	}
-	defer file.Close()
-
-	postWriter := csv.NewWriter(file)
-	defer postWriter.Flush()
-
-	if err := postWriter.Write([]string{"id", "location", "content"}); err != nil {
-		log.Fatal(err)
-	}
-
-	file, err = os.Create(attachmentsFile)
-	if err != nil {
-		log.Fatal(err)
-	}
-	defer file.Close()
-
-	attachmentsWriter := csv.NewWriter(file)
-	defer attachmentsWriter.Flush()
-
-	if err := attachmentsWriter.Write([]string{"id", "image"}); err != nil {
-		log.Fatal(err)
-	}
+	var wg sync.WaitGroup
+	imgChan := make(chan Image, 64)
+	postChan := make(chan *Post, 32)
+	imgsChan := make(chan *Post, 32)
 
 	if err := os.MkdirAll(imagesDir, os.ModePerm); err != nil {
 		log.Fatal(err)
 	}
 
-	opts := append(chromedp.DefaultExecAllocatorOptions[:], chromedp.Flag("headless", false))
-	browser, close := chromedp.NewExecAllocator(context.Background(), opts...)
-	defer close()
+	for i := 1; i <= 6; i++ {
+		wg.Add(1)
+		go func(imgChan <-chan Image, wg *sync.WaitGroup) {
+			defer wg.Done()
 
-	ctx, close := chromedp.NewContext(browser)
-	defer close()
+			for img := range imgChan {
+				if err := img.Download(filepath.Join(imagesDir, img.Name)); err != nil {
+					log.Println(err)
+					continue
+				}
+			}
+		}(imgChan, &wg)
+	}
+
+	wg.Add(1)
+	go func(postChan <-chan *Post, wg *sync.WaitGroup) {
+		defer wg.Done()
+
+		file, err := os.Create(postsFile)
+		if err != nil {
+			log.Fatal(err)
+		}
+		defer file.Close()
+
+		postWriter := csv.NewWriter(file)
+		defer postWriter.Flush()
+
+		if err := postWriter.Write([]string{"id", "location", "content"}); err != nil {
+			log.Fatal(err)
+		}
+
+		for post := range postChan {
+			if err := postWriter.Write([]string{post.ID, fmt.Sprintf("%s", post.Location), fmt.Sprintf("%s", strings.ReplaceAll(post.Content, `"`, `'`))}); err != nil {
+				log.Println(err)
+				continue
+			}
+		}
+	}(postChan, &wg)
+
+	wg.Add(1)
+	go func(imgsChan <-chan *Post, wg *sync.WaitGroup) {
+		defer wg.Done()
+
+		file, err := os.Create(attachmentsFile)
+		if err != nil {
+			log.Fatal(err)
+		}
+		defer file.Close()
+
+		attachmentsWriter := csv.NewWriter(file)
+		defer attachmentsWriter.Flush()
+
+		if err := attachmentsWriter.Write([]string{"id", "image"}); err != nil {
+			log.Fatal(err)
+		}
+
+		for post := range imgsChan {
+			for _, img := range post.Images {
+				if err := attachmentsWriter.Write([]string{post.ID, img.Name}); err != nil {
+					log.Println(err)
+					continue
+				}
+
+				imgChan <- img
+			}
+		}
+	}(imgsChan, &wg)
+
+	opts := append(chromedp.DefaultExecAllocatorOptions[:], chromedp.Flag("headless", false))
+	browser, cancel := chromedp.NewExecAllocator(context.Background(), opts...)
+	defer cancel()
+
+	ctx, cancel := chromedp.NewContext(browser)
+	defer cancel()
 
 	log.Println("Retrieving facebook group...")
 	feed, err := getFacebookGroupFeed(ctx, groupID)
@@ -139,8 +186,8 @@ func main() {
 			chromedp.Evaluate(`document.querySelectorAll('[data-ad-preview="message"] div:last-child[role="button"]').forEach((n)=> n.click())`, nil),
 			// Retrieve the posts that have images
 			chromedp.ActionFunc(func(ctx context.Context) error {
-				timeoutCtx, close := context.WithTimeout(ctx, timeout*time.Second)
-				defer close()
+				timeoutCtx, cancel := context.WithTimeout(ctx, timeout*time.Second)
+				defer cancel()
 
 				return chromedp.Nodes(`[aria-posinset][role="article"] div:not([class]):nth-child(3):has(a img[src*="fna.fbcdn.net"])`, &postNodes, chromedp.ByQueryAll, chromedp.FromNode(feed)).Do(timeoutCtx)
 			}),
@@ -167,21 +214,8 @@ func main() {
 				continue
 			}
 
-			if err := postWriter.Write([]string{post.ID, fmt.Sprintf("%s", post.Location), fmt.Sprintf("%s", strings.ReplaceAll(post.Content, `"`, `'`))}); err != nil {
-				log.Fatal(err)
-			}
-
-			for _, image := range post.Images {
-				if err := attachmentsWriter.Write([]string{post.ID, image.Name}); err != nil {
-					log.Fatal(err)
-				}
-
-				log.Printf("Downloading %s...\n", image.Name)
-				if err := image.Download(filepath.Join(imagesDir, image.Name)); err != nil {
-					log.Println(err)
-					continue
-				}
-			}
+			postChan <- post
+			imgsChan <- post
 		}
 
 		retries = 0
@@ -192,6 +226,11 @@ func main() {
 			log.Fatal(err)
 		}
 	}
+
+	close(imgChan)
+	close(postChan)
+	close(imgsChan)
+	wg.Wait()
 }
 
 func extractPost(postNode *cdp.Node, ctx context.Context) (*Post, error) {
