@@ -31,14 +31,40 @@ const (
 )
 
 var (
-	locationRegex        = regexp.MustCompile(`(?i)loc(?:ation)?(?:.*?)([^ation]\w[\w\ \,]+)`)
-	LoginBypassFailed    = errors.New("error: unable to bypass redirect to login page")
-	UnableToRetrieveFeed = errors.New("error: unable to retrieve feed")
+	locationRegex    = regexp.MustCompile(`(?i)loc(?:ation)?(?:.*?)([^ation]\w[\w\ \,]+)`)
+	BypassFailed     = errors.New("error: unable to bypass redirect")
+	UnableToRetrieve = errors.New("error: unable to retrieve")
+	UnableToDownload = errors.New("error: unable to download image")
 )
 
 type Image struct {
-	name string
-	url  string
+	Name string
+	Url  string
+}
+
+func (image Image) Download(path string) error {
+	file, err := os.Create(path)
+	if err != nil {
+		return fmt.Errorf("image %s: %s\n", image.Name, err.Error())
+	}
+	defer file.Close()
+
+	resp, err := http.Get(image.Url)
+	if err != nil {
+		return fmt.Errorf("image %s: %s\n", image.Name, err.Error())
+	}
+	defer resp.Body.Close()
+
+	if resp.StatusCode != http.StatusOK {
+		return fmt.Errorf("image %s: %s\n", image.Name, UnableToDownload.Error())
+	}
+
+	_, err = io.Copy(file, resp.Body)
+	if err != nil {
+		return fmt.Errorf("image %s: %s\n", image.Name, err.Error())
+	}
+
+	return nil
 }
 
 type Post struct {
@@ -53,6 +79,7 @@ func main() {
 	// Rate limit to limit the number of parses per second
 	// Output folder to save the images to
 	// Filenames for the csvs
+
 	file, err := os.Create(postsFile)
 	if err != nil {
 		log.Fatal(err)
@@ -145,36 +172,15 @@ func main() {
 			}
 
 			for _, image := range post.Images {
-				if err := attachmentsWriter.Write([]string{post.ID, image.name}); err != nil {
+				if err := attachmentsWriter.Write([]string{post.ID, image.Name}); err != nil {
 					log.Fatal(err)
 				}
 
-				log.Printf("Downloading %s...\n", image.name)
-				file, err := os.Create(filepath.Join(imagesDir, image.name))
-				if err != nil {
+				log.Printf("Downloading %s...\n", image.Name)
+				if err := image.Download(filepath.Join(imagesDir, image.Name)); err != nil {
 					log.Println(err)
 					continue
 				}
-
-				resp, err := http.Get(image.url)
-				if err != nil {
-					log.Println(err)
-					continue
-				}
-
-				if resp.StatusCode != http.StatusOK {
-					log.Printf("Error: %s\n", resp.Status)
-					continue
-				}
-
-				_, err = io.Copy(file, resp.Body)
-				if err != nil {
-					log.Println(err)
-					continue
-				}
-
-				resp.Body.Close()
-				file.Close()
 			}
 		}
 
@@ -200,12 +206,12 @@ func extractPost(postNode *cdp.Node, ctx context.Context) (*Post, error) {
 		// Get Post Images
 		chromedp.Nodes(`img[src*="fna.fbcdn.net"]`, &imageNodes, chromedp.ByQueryAll, chromedp.FromNode(postNode)),
 	); err != nil {
-		return nil, err
+		return nil, fmt.Errorf("post: %s\n", err.Error())
 	}
 
 	postUrl, err := url.Parse(aNodes[0].AttributeValue("href"))
 	if err != nil {
-		return nil, err
+		return nil, fmt.Errorf("post: %s\n", err.Error())
 	}
 
 	if strings.Contains(strings.ToLower(content), "loc") {
@@ -231,8 +237,8 @@ func extractPost(postNode *cdp.Node, ctx context.Context) (*Post, error) {
 		}
 
 		post.Images = append(post.Images, Image{
-			name: filepath.Base(imgUrl.Path),
-			url:  img.AttributeValue("src"),
+			Name: filepath.Base(imgUrl.Path),
+			Url:  img.AttributeValue("src"),
 		})
 	}
 
@@ -299,7 +305,8 @@ func navigateWithBypass(url string, sleep time.Duration, retries int) chromedp.A
 		}
 
 		if navigatedUrl != url {
-			return LoginBypassFailed
+			return fmt.Errorf("login page: %s\n", BypassFailed.Error())
+
 		}
 
 		return nil
@@ -325,7 +332,7 @@ func getFacebookGroupFeed(ctx context.Context, groupID string) (*cdp.Node, error
 	); err != nil {
 		return nil, err
 	} else if len(nodes) == 0 {
-		return nil, UnableToRetrieveFeed
+		return nil, fmt.Errorf("feed %s: %s\n", groupID, UnableToRetrieve.Error())
 	}
 
 	return nodes[0], nil
