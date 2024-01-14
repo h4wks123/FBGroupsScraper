@@ -51,7 +51,7 @@ func main() {
 	}
 
 	// Track the feed for stability (i.e., no changes have occured to its children after a period of time)
-	if err := chromedp.Run(ctx, trackNodeStability(feed.FullXPath(), "feed", time.Second)); err != nil {
+	if err := chromedp.Run(ctx, chromedp.Evaluate(trackNodeStabilityJS(feed.FullXPath(), "feed", time.Second), nil)); err != nil {
 		log.Fatal(err)
 	}
 
@@ -65,9 +65,9 @@ func main() {
 			// Expand all content
 			chromedp.Evaluate(`document.querySelectorAll('[data-ad-preview="message"] div:last-child[role="button"]').forEach((n)=> n.click())`, nil),
 			// Retrieve the posts that have images
-			runTasksWithTimeout(5*time.Second, chromedp.Tasks{
+			runTasksWithTimeout(5*time.Second,
 				chromedp.Nodes(`[aria-posinset][role="article"] div:nth-child(3):has(img[src*="fna.fbcdn.net"])`, &postNodes, chromedp.ByQueryAll, chromedp.FromNode(feed)),
-			}),
+			),
 		); err != nil {
 			if err != context.DeadlineExceeded || retries >= maxRetries {
 				log.Fatal(err)
@@ -110,7 +110,7 @@ func extractPost(postNode *cdp.Node, ctx context.Context) (*Post, error) {
 
 	if err := chromedp.Run(ctx,
 		// Get Post Content
-		getAllTextContentInNode(postNode.FullXPath(), &content),
+		chromedp.Evaluate(extractPostContentJS(postNode.FullXPath()), &content),
 		// Get Post Image Links
 		chromedp.Nodes(`a[role="link"]`, &aNodes, chromedp.ByQueryAll, chromedp.FromNode(postNode)),
 		// Get Post Images
@@ -153,8 +153,8 @@ func extractPost(postNode *cdp.Node, ctx context.Context) (*Post, error) {
 	return post, nil
 }
 
-func getAllTextContentInNode(xpath string, contentRef *string) chromedp.Action {
-	return chromedp.Evaluate(fmt.Sprintf(`
+func extractPostContentJS(xpath string) string {
+	return fmt.Sprintf(`
         (function() {
             let text = "";
             const content = document
@@ -169,11 +169,11 @@ func getAllTextContentInNode(xpath string, contentRef *string) chromedp.Action {
 
             return text
         })()
-    `, xpath), &contentRef)
+    `, xpath)
 }
 
-func trackNodeStability(xpath, label string, debounce time.Duration) chromedp.Action {
-	return chromedp.Evaluate(fmt.Sprintf(`
+func trackNodeStabilityJS(xpath, label string, debounce time.Duration) string {
+	return fmt.Sprintf(`
         window.stable = window.stable || {};
         let node = document.evaluate("%s", document, null, XPathResult.FIRST_ORDERED_NODE_TYPE, null)?.singleNodeValue;
 
@@ -188,15 +188,15 @@ func trackNodeStability(xpath, label string, debounce time.Duration) chromedp.Ac
 
             window.stable["%s"].observer.observe(node, { childList: true });
         }
-    `, xpath, label, label, label, label, label, label, label, debounce.Milliseconds(), label), nil)
+    `, xpath, label, label, label, label, label, label, label, debounce.Milliseconds(), label)
 }
 
-func runTasksWithTimeout(timeout time.Duration, tasks chromedp.Tasks) chromedp.ActionFunc {
+func runTasksWithTimeout(timeout time.Duration, tasks ...chromedp.Action) chromedp.ActionFunc {
 	return func(ctx context.Context) error {
 		timeoutCtx, cancel := context.WithTimeout(ctx, timeout)
 		defer cancel()
 
-		return tasks.Do(timeoutCtx)
+		return chromedp.Tasks(tasks).Do(timeoutCtx)
 	}
 }
 
