@@ -11,9 +11,10 @@ import (
 )
 
 const (
-	endpoint = `https://www.facebook.com/groups`
-	groupID  = `900072927547214`
-	timeout  = 15
+	endpoint   = `https://www.facebook.com/groups`
+	groupID    = `900072927547214`
+	timeout    = 15
+	maxRetries = 5
 )
 
 func main() {
@@ -24,7 +25,11 @@ func main() {
 	// Filenames for the csvs
 	// Make it optional to scrape comments and attachments
 
-	ctx, cancel := chromedp.NewContext(context.Background())
+	opts := append(chromedp.DefaultExecAllocatorOptions[:], chromedp.Flag("headless", false))
+	browserCtx, closeBrowser := chromedp.NewExecAllocator(context.Background(), opts...)
+	defer closeBrowser()
+
+	ctx, cancel := chromedp.NewContext(browserCtx)
 	defer cancel()
 
 	log.Println("Retrieving facebook group...")
@@ -33,55 +38,117 @@ func main() {
 		log.Fatal(err)
 	}
 
+	// Track the feed for stability (i.e., no changes have occured to its children after a period of time)
+	if err := chromedp.Run(ctx, trackNodeStability(feed.FullXPath(), "feed", time.Second)); err != nil {
+		log.Fatal(err)
+	}
+
 	log.Println("Retrieving posts...")
+	var retries int
 	var posts []*cdp.Node
-	for i := 0; i < 5; i++ {
-        if err := chromedp.Run(ctx,
-			// Check if all content is loaded, at most 5 posts are loaded at a time
-			// along with 3 nodes for the next set of posts breakpoint, loading indicator, and a buffer element
-			chromedp.Poll(`document.querySelector('[data-pagelet="GroupFeed"] > [role="feed"]').children.length >= 8`,
-				nil,
-				chromedp.WithPollingInFrame(feed),
-				chromedp.WithPollingMutation(),
-				chromedp.WithPollingTimeout(timeout*time.Second),
-			),
-			// Get all the visible posts from the group feed
-			chromedp.Nodes(`[aria-posinset][role="article"]`, &posts, chromedp.ByQueryAll, chromedp.FromNode(feed)),
-		); err != nil {
+	for i := 0; i < 10; i++ {
+		if err := chromedp.Run(ctx, chromedp.Poll(`window.stable.feed.value`, nil, chromedp.WithPollingTimeout(timeout*time.Second))); err != nil {
 			log.Fatal(err)
 		}
 
-		// TODO: Priority 2, start parsing data from the posts
-		// Should generally be composed of four parts
-		// 1. Parse the post content along with the author, date of post, and the content, as well as a generated ID or post ID if possible
-		// 2. Attachment parsing if there are attachments, this links to the post ID, as well as the attachment link, and the type (image / video)
-		// 3. Comments parsing if there are comments, this links to the post ID, as well as the comment ID, parent ID, the author, and the comment content
-		// 4. Attachments should be downloaded to a folder with the post ID as the name
+		if err := chromedp.Run(ctx,
+			runTasksWithTimeout(5*time.Second, chromedp.Tasks{
+				chromedp.Nodes(`[aria-posinset][role="article"] div:nth-child(3):has(img[src*="fna.fbcdn.net"])`, &posts, chromedp.ByQueryAll, chromedp.FromNode(feed)),
+			}),
+		); err != nil {
+			if retries = retries + 1; err == context.DeadlineExceeded && retries <= maxRetries {
+				if err := chromedp.Run(ctx, chromedp.Evaluate(`window.scrollTo(0, document.body.scrollHeight);`, nil)); err != nil {
+					log.Fatal(err)
+				}
 
-		// those above are required if I want to make this a generic scraper, but for now I just want to scrape snake data
+				continue
+			}
+
+			log.Fatal(err)
+		}
+
+		retries = 0
 		// thus the only thing I need are the images, the locations, and optionally the name of the snakes
+
+		// to get HD images, we need to source the photo links NOT the image links, and then wait for the page to load
+		// var content string
+
+		// create a channel, to receive the image links, and then delegate it to goroutines, so it runs in the background
+
+		var images []*cdp.Node
 		var content string
 		for _, post := range posts {
-			if err := chromedp.Run(ctx,
-				chromedp.InnerHTML(`[data-ad-comet-preview="message"] span`, &content, chromedp.ByQuery, chromedp.FromNode(post)),
-			); err != nil {
+			if err := chromedp.Run(ctx, chromedp.Nodes(`img[src*="fna.fbcdn.net"]`, &images, chromedp.ByQueryAll, chromedp.FromNode(post))); err != nil {
 				log.Fatal(err)
 			}
 
-			log.Printf("Post content: %s", content)
+			if err := chromedp.Run(ctx, getAllTextContentInNode(post.FullXPath(), &content)); err != nil {
+				log.Fatal(err)
+			}
+
+			for _, img := range images {
+				fmt.Println(img.AttributeValue("src"))
+			}
+
+			fmt.Println(content)
 		}
 
 		if err := chromedp.Run(ctx,
-			// Remove the posts that have already been parsed from the dom
-			chromedp.Evaluate(`document.querySelectorAll('[data-pagelet="GroupFeed"] > [role="feed"] div:nth-last-child(n+4)').forEach((n) => n.remove());`, nil),
+			chromedp.Evaluate(`document.querySelectorAll('[data-pagelet="GroupFeed"] > [role="feed"] > div:nth-last-child(n+4)').forEach((n) => n?.remove());`, nil),
 		); err != nil {
 			log.Fatal(err)
 		}
 	}
-
-	// TODO: Priority 3: Potential end of page reached, check what it looks like, and how to handle it
 }
 
+func getAllTextContentInNode(xpath string, contentRef *string) chromedp.Action {
+	return chromedp.Evaluate(fmt.Sprintf(`
+        (function() {
+            let text = "";
+            const content = document
+                .evaluate("%s", document, null, XPathResult.FIRST_ORDERED_NODE_TYPE, null)
+                ?.singleNodeValue
+                ?.querySelector("[data-ad-preview='message']");
+
+            if (content) {
+                const walker = document.createTreeWalker(content, NodeFilter.SHOW_TEXT); 
+                while(walker.nextNode()) text += walker.currentNode.textContent + "\n";
+            }
+
+            return text
+        })()
+    `, xpath), &contentRef)
+}
+
+func trackNodeStability(xpath, label string, debounce time.Duration) chromedp.Action {
+	return chromedp.Evaluate(fmt.Sprintf(`
+        window.stable = window.stable || {};
+        let node = document.evaluate("%s", document, null, XPathResult.FIRST_ORDERED_NODE_TYPE, null)?.singleNodeValue;
+
+        if(node) {
+            window.stable["%s"] = window.stable["%s"] || {};
+            window.stable["%s"].observer = new MutationObserver(function() {
+                window.stable["%s"].value = false;
+
+                clearTimeout(window.stable["%s"].timeout);
+                window.stable["%s"].timeout = setTimeout(() => window.stable["%s"].value = true, %d);
+            });
+
+            window.stable["%s"].observer.observe(node, { childList: true });
+        }
+    `, xpath, label, label, label, label, label, label, label, debounce.Milliseconds(), label), nil)
+}
+
+func runTasksWithTimeout(timeout time.Duration, tasks chromedp.Tasks) chromedp.ActionFunc {
+	return func(ctx context.Context) error {
+		timeoutCtx, cancel := context.WithTimeout(ctx, timeout)
+		defer cancel()
+
+		return tasks.Do(timeoutCtx)
+	}
+}
+
+// add the cookie script here
 func getFacebookGroupFeed(c context.Context, groupID string) (*cdp.Node, error) {
 	var nodes []*cdp.Node
 	tasks := chromedp.Tasks{
