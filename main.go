@@ -4,6 +4,8 @@ import (
 	"context"
 	"fmt"
 	"log"
+	"net/url"
+	"path"
 	"time"
 
 	"github.com/chromedp/cdproto/cdp"
@@ -16,6 +18,12 @@ const (
 	timeout    = 15
 	maxRetries = 5
 )
+
+type Post struct {
+	id      int64
+	content string
+	images  []string
+}
 
 func main() {
 	// TODO: Priority 4: Add a way to pass the following as command line arguments
@@ -45,15 +53,16 @@ func main() {
 
 	log.Println("Retrieving posts...")
 	var retries int
-	var content string
-	var posts, images []*cdp.Node
+	var postsScraped int64
+	var postNodes, imageNodes []*cdp.Node
+	data := Post{images: make([]string, 0)}
 	for i := 0; i < 10; i++ {
 		if err := chromedp.Run(ctx,
 			// Wait for the feed to become stable
 			chromedp.Poll(`window.stable.feed.value`, nil, chromedp.WithPollingTimeout(timeout*time.Second)),
 			// Retrieve the posts that have images
 			runTasksWithTimeout(5*time.Second, chromedp.Tasks{
-				chromedp.Nodes(`[aria-posinset][role="article"] div:nth-child(3):has(img[src*="fna.fbcdn.net"])`, &posts, chromedp.ByQueryAll, chromedp.FromNode(feed)),
+				chromedp.Nodes(`[aria-posinset][role="article"] div:nth-child(3):has(img[src*="fna.fbcdn.net"])`, &postNodes, chromedp.ByQueryAll, chromedp.FromNode(feed)),
 			}),
 		); err != nil {
 			if err != context.DeadlineExceeded || retries >= maxRetries {
@@ -75,20 +84,31 @@ func main() {
 
 		// create a channel, to receive the image links, and then delegate it to goroutines, so it runs in the background
 
-		for _, post := range posts {
-			if err := chromedp.Run(ctx, chromedp.Nodes(`img[src*="fna.fbcdn.net"]`, &images, chromedp.ByQueryAll, chromedp.FromNode(post))); err != nil {
+		for _, post := range postNodes {
+			postsScraped = postsScraped + 1
+			data.id = postsScraped
+
+			if err := chromedp.Run(ctx, chromedp.Nodes(`img[src*="fna.fbcdn.net"]`, &imageNodes, chromedp.ByQueryAll, chromedp.FromNode(post))); err != nil {
 				log.Fatal(err)
 			}
 
-			if err := chromedp.Run(ctx, getAllTextContentInNode(post.FullXPath(), &content)); err != nil {
+			if err := chromedp.Run(ctx, getAllTextContentInNode(post.FullXPath(), &data.content)); err != nil {
 				log.Fatal(err)
 			}
 
-			for _, img := range images {
-				fmt.Println(img.AttributeValue("src"))
+			data.images = data.images[:0]
+			for _, img := range imageNodes {
+				imgUrl, err := url.Parse(img.AttributeValue("src"))
+				if err != nil {
+					log.Print(err)
+					continue
+				}
+
+				_, filename := path.Split(imgUrl.Path)
+				data.images = append(data.images, filename)
 			}
 
-			fmt.Println(content)
+			fmt.Printf("%+v\n", data)
 		}
 
 		// Reset the retries
