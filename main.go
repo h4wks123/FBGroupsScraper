@@ -6,6 +6,8 @@ import (
 	"log"
 	"net/url"
 	"path"
+	"regexp"
+	"strings"
 	"time"
 
 	"github.com/chromedp/cdproto/cdp"
@@ -17,21 +19,23 @@ const (
 	groupID    = `900072927547214`
 	timeout    = 15
 	maxRetries = 5
+	maxPosts   = 10 // this is just a min bound, the actual number of posts scraped may be higher than this
 )
 
+var locationRegex = regexp.MustCompile(`(?i)loc(?:ation)?(?:.*?)([^ation]\w[\w\ \,]+)`)
+
 type Post struct {
-	id      int64
-	content string
-	images  []string
+	ID       int64
+	Location string
+	Content  string
+	Images   []string
 }
 
 func main() {
 	// TODO: Priority 4: Add a way to pass the following as command line arguments
 	// Rate limit to limit the number of parses per second
-	// Post size to limit the number of posts
 	// Output folder to save the images to
 	// Filenames for the csvs
-	// Make it optional to scrape comments and attachments
 
 	opts := append(chromedp.DefaultExecAllocatorOptions[:], chromedp.Flag("headless", false))
 	browserCtx, closeBrowser := chromedp.NewExecAllocator(context.Background(), opts...)
@@ -55,8 +59,9 @@ func main() {
 	var retries int
 	var postsScraped int64
 	var postNodes, imageNodes []*cdp.Node
-	data := Post{images: make([]string, 0)}
-	for i := 0; i < 10; i++ {
+	data := Post{Images: make([]string, 0)}
+
+	for postsScraped <= maxPosts {
 		if err := chromedp.Run(ctx,
 			// Wait for the feed to become stable
 			chromedp.Poll(`window.stable.feed.value`, nil, chromedp.WithPollingTimeout(timeout*time.Second)),
@@ -79,26 +84,23 @@ func main() {
 			continue
 		}
 
-		// thus the only thing I need are the images, the locations, and optionally the name of the snakes
-
-		// to get HD images, we need to source the photo links NOT the image links, and then wait for the page to load
-		// var content string
-
 		// create a channel, to receive the image links, and then delegate it to goroutines, so it runs in the background
-
 		for _, post := range postNodes {
 			postsScraped = postsScraped + 1
-			data.id = postsScraped
+			data.ID = postsScraped
 
+			if err := chromedp.Run(ctx, getAllTextContentInNode(post.FullXPath(), &data.Content)); err != nil {
+				log.Print(err)
+				continue
+			}
+
+			data.Location = extractPostLocation(data.Content)
 			if err := chromedp.Run(ctx, chromedp.Nodes(`img[src*="fna.fbcdn.net"]`, &imageNodes, chromedp.ByQueryAll, chromedp.FromNode(post))); err != nil {
-				log.Fatal(err)
+				log.Print(err)
+				continue
 			}
 
-			if err := chromedp.Run(ctx, getAllTextContentInNode(post.FullXPath(), &data.content)); err != nil {
-				log.Fatal(err)
-			}
-
-			data.images = data.images[:0]
+			data.Images = data.Images[:0]
 			for _, img := range imageNodes {
 				imgUrl, err := url.Parse(img.AttributeValue("src"))
 				if err != nil {
@@ -107,21 +109,32 @@ func main() {
 				}
 
 				_, filename := path.Split(imgUrl.Path)
-				data.images = append(data.images, filename)
+				data.Images = append(data.Images, filename)
 			}
 
 			fmt.Printf("%+v\n", data)
 		}
 
-		// Reset the retries
 		retries = 0
-		// Remove the posts that have been processed
 		if err := chromedp.Run(ctx,
+			// Remove the posts that have been processed
 			chromedp.Evaluate(`document.querySelectorAll('[data-pagelet="GroupFeed"] > [role="feed"] > div:nth-last-child(n+4)').forEach((n) => n.remove());`, nil),
 		); err != nil {
 			log.Fatal(err)
 		}
 	}
+}
+
+func extractPostLocation(content string) string {
+	if strings.Contains(strings.ToLower(content), "loc") {
+		for _, line := range strings.Split(content, "\n") {
+			if match := locationRegex.FindStringSubmatch(line); len(match) > 1 {
+				return strings.TrimSpace(match[1])
+			}
+		}
+	}
+
+	return ""
 }
 
 func getAllTextContentInNode(xpath string, contentRef *string) chromedp.Action {
