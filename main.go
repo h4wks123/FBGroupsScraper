@@ -45,29 +45,29 @@ func main() {
 
 	log.Println("Retrieving posts...")
 	var retries int
-	var posts []*cdp.Node
+	var content string
+	var posts, images []*cdp.Node
 	for i := 0; i < 10; i++ {
-		if err := chromedp.Run(ctx, chromedp.Poll(`window.stable.feed.value`, nil, chromedp.WithPollingTimeout(timeout*time.Second))); err != nil {
-			log.Fatal(err)
-		}
-
 		if err := chromedp.Run(ctx,
+			// Wait for the feed to become stable
+			chromedp.Poll(`window.stable.feed.value`, nil, chromedp.WithPollingTimeout(timeout*time.Second)),
+			// Retrieve the posts that have images
 			runTasksWithTimeout(5*time.Second, chromedp.Tasks{
 				chromedp.Nodes(`[aria-posinset][role="article"] div:nth-child(3):has(img[src*="fna.fbcdn.net"])`, &posts, chromedp.ByQueryAll, chromedp.FromNode(feed)),
 			}),
 		); err != nil {
-			if retries = retries + 1; err == context.DeadlineExceeded && retries <= maxRetries {
-				if err := chromedp.Run(ctx, chromedp.Evaluate(`window.scrollTo(0, document.body.scrollHeight);`, nil)); err != nil {
-					log.Fatal(err)
-				}
-
-				continue
+			if err != context.DeadlineExceeded || retries >= maxRetries {
+				log.Fatal(err)
 			}
 
-			log.Fatal(err)
+			retries = retries + 1
+			if err := chromedp.Run(ctx, chromedp.Evaluate(`window.scrollTo(0, document.body.scrollHeight);`, nil)); err != nil {
+				log.Fatal(err)
+			}
+
+			continue
 		}
 
-		retries = 0
 		// thus the only thing I need are the images, the locations, and optionally the name of the snakes
 
 		// to get HD images, we need to source the photo links NOT the image links, and then wait for the page to load
@@ -75,8 +75,6 @@ func main() {
 
 		// create a channel, to receive the image links, and then delegate it to goroutines, so it runs in the background
 
-		var images []*cdp.Node
-		var content string
 		for _, post := range posts {
 			if err := chromedp.Run(ctx, chromedp.Nodes(`img[src*="fna.fbcdn.net"]`, &images, chromedp.ByQueryAll, chromedp.FromNode(post))); err != nil {
 				log.Fatal(err)
@@ -93,6 +91,9 @@ func main() {
 			fmt.Println(content)
 		}
 
+		// Reset the retries
+		retries = 0
+		// Remove the posts that have been processed
 		if err := chromedp.Run(ctx,
 			chromedp.Evaluate(`document.querySelectorAll('[data-pagelet="GroupFeed"] > [role="feed"] > div:nth-last-child(n+4)').forEach((n) => n?.remove());`, nil),
 		); err != nil {
