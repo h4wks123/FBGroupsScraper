@@ -56,11 +56,10 @@ func main() {
 	}
 
 	log.Println("Retrieving posts...")
-	var retries int
-	var postsScraped int64
+	var retries, postsScraped int64
 	var postNodes, imageNodes []*cdp.Node
-	data := Post{Images: make([]string, 0)}
 
+	data := Post{Images: make([]string, 0)}
 	for postsScraped <= maxPosts {
 		if err := chromedp.Run(ctx,
 			// Wait for the feed to become stable
@@ -184,12 +183,43 @@ func runTasksWithTimeout(timeout time.Duration, tasks chromedp.Tasks) chromedp.A
 	}
 }
 
-// add the cookie script here
+func navigateWithBypass(url string, sleep time.Duration, retries int) chromedp.ActionFunc {
+	return func(ctx context.Context) error {
+		var navigatedUrl string
+
+		err := chromedp.Tasks{
+			chromedp.Navigate(url),
+			chromedp.Location(&navigatedUrl),
+		}.Do(ctx)
+		if err != nil {
+			return err
+		}
+
+		for i := 0; navigatedUrl != url && i < retries; i++ {
+			err := chromedp.Tasks{
+				chromedp.Sleep(sleep),
+				chromedp.Navigate(url),
+				chromedp.Location(&navigatedUrl),
+			}.Do(ctx)
+			if err != nil {
+				return err
+			}
+		}
+
+		if navigatedUrl != url {
+			return fmt.Errorf("error: unable to bypass redirect to login page")
+		}
+
+		return nil
+	}
+}
+
 func getFacebookGroupFeed(c context.Context, groupID string) (*cdp.Node, error) {
 	var nodes []*cdp.Node
+
 	tasks := chromedp.Tasks{
-		// Navigate to page
-		chromedp.Navigate(fmt.Sprintf("%s/%s/", endpoint, groupID)),
+		// Bypass Facebook's redirect to the Login page
+		navigateWithBypass(fmt.Sprintf("%s/%s/", endpoint, groupID), 5*time.Second, 3),
 		// Wait for the login popup to appear
 		chromedp.WaitVisible(`#login_popup_cta_form`, chromedp.ByQuery),
 		// Close the login popup
