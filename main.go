@@ -5,7 +5,9 @@ import (
 	"encoding/csv"
 	"errors"
 	"fmt"
+	"io"
 	"log"
+	"net/http"
 	"net/url"
 	"os"
 	"path/filepath"
@@ -22,6 +24,7 @@ const (
 	groupID         = `900072927547214`
 	postsFile       = "posts.csv"
 	attachmentsFile = "attachments.csv"
+	imagesDir       = "images"
 	timeout         = 5
 	maxRetries      = 5
 	maxPosts        = 10 // this is just a min bound, the actual number of posts scraped may be higher than this
@@ -33,11 +36,16 @@ var (
 	UnableToRetrieveFeed = errors.New("error: unable to retrieve feed")
 )
 
+type Image struct {
+	name string
+	url  string
+}
+
 type Post struct {
 	ID       string
 	Location string
 	Content  string
-	Images   []string
+	Images   []Image
 }
 
 func main() {
@@ -68,6 +76,10 @@ func main() {
 	defer attachmentsWriter.Flush()
 
 	if err := attachmentsWriter.Write([]string{"id", "image"}); err != nil {
+		log.Fatal(err)
+	}
+
+	if err := os.MkdirAll(imagesDir, os.ModePerm); err != nil {
 		log.Fatal(err)
 	}
 
@@ -103,7 +115,7 @@ func main() {
 				timeoutCtx, close := context.WithTimeout(ctx, timeout*time.Second)
 				defer close()
 
-				return chromedp.Nodes(`[aria-posinset][role="article"] div:nth-child(3):has(img[src*="fna.fbcdn.net"])`, &postNodes, chromedp.ByQueryAll, chromedp.FromNode(feed)).Do(timeoutCtx)
+				return chromedp.Nodes(`[aria-posinset][role="article"] div:not([class]):nth-child(3):has(a img[src*="fna.fbcdn.net"])`, &postNodes, chromedp.ByQueryAll, chromedp.FromNode(feed)).Do(timeoutCtx)
 			}),
 		); err != nil {
 			if err != context.DeadlineExceeded || retries >= maxRetries {
@@ -133,9 +145,36 @@ func main() {
 			}
 
 			for _, image := range post.Images {
-				if err := attachmentsWriter.Write([]string{post.ID, image}); err != nil {
+				if err := attachmentsWriter.Write([]string{post.ID, image.name}); err != nil {
 					log.Fatal(err)
 				}
+
+				log.Printf("Downloading %s...\n", image.name)
+				file, err := os.Create(filepath.Join(imagesDir, image.name))
+				if err != nil {
+					log.Println(err)
+					continue
+				}
+
+				resp, err := http.Get(image.url)
+				if err != nil {
+					log.Println(err)
+					continue
+				}
+
+				if resp.StatusCode != http.StatusOK {
+					log.Printf("Error: %s\n", resp.Status)
+					continue
+				}
+
+				_, err = io.Copy(file, resp.Body)
+				if err != nil {
+					log.Println(err)
+					continue
+				}
+
+				resp.Body.Close()
+				file.Close()
 			}
 		}
 
@@ -182,7 +221,7 @@ func extractPost(postNode *cdp.Node, ctx context.Context) (*Post, error) {
 		ID:       strings.TrimPrefix(strings.TrimPrefix(postUrl.Query().Get("set"), "pcb."), "gm."),
 		Location: location,
 		Content:  content,
-		Images:   make([]string, 0, len(imageNodes)),
+		Images:   make([]Image, 0, len(imageNodes)),
 	}
 
 	for _, img := range imageNodes {
@@ -191,7 +230,10 @@ func extractPost(postNode *cdp.Node, ctx context.Context) (*Post, error) {
 			continue
 		}
 
-		post.Images = append(post.Images, filepath.Base(imgUrl.Path))
+		post.Images = append(post.Images, Image{
+			name: filepath.Base(imgUrl.Path),
+			url:  img.AttributeValue("src"),
+		})
 	}
 
 	return post, nil
