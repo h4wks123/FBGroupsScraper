@@ -2,12 +2,9 @@ package main
 
 import (
 	"context"
-	"encoding/csv"
 	"errors"
 	"fmt"
-	"io"
 	"log"
-	"net/http"
 	"net/url"
 	"os"
 	"path/filepath"
@@ -16,6 +13,7 @@ import (
 	"sync"
 	"time"
 
+	"github.com/LaplaceXD/FBGroupsScraper/models"
 	"github.com/LaplaceXD/FBGroupsScraper/scripts"
 	"github.com/LaplaceXD/FBGroupsScraper/workers"
 	"github.com/chromedp/cdproto/cdp"
@@ -37,74 +35,7 @@ var (
 	locationRegex    = regexp.MustCompile(`(?i)loc(?:ation)?(?:.*?)([^ation]\w[\w\ \,]+)`)
 	BypassFailed     = errors.New("error: unable to bypass redirect")
 	UnableToRetrieve = errors.New("error: unable to retrieve")
-	UnableToDownload = errors.New("error: unable to download image")
 )
-
-type Image struct {
-	Name string
-	Url  string
-}
-
-func (img Image) Download(path string) error {
-	file, err := os.Create(path)
-	if err != nil {
-		return fmt.Errorf("image %s: %s\n", img.Name, err.Error())
-	}
-	defer file.Close()
-
-	resp, err := http.Get(img.Url)
-	if err != nil {
-		return fmt.Errorf("image %s: %s\n", img.Name, err.Error())
-	}
-	defer resp.Body.Close()
-
-	if resp.StatusCode != http.StatusOK {
-		return fmt.Errorf("image %s: %s\n", img.Name, UnableToDownload.Error())
-	}
-
-	_, err = io.Copy(file, resp.Body)
-	if err != nil {
-		return fmt.Errorf("image %s: %s\n", img.Name, err.Error())
-	}
-
-	return nil
-}
-
-type Attachments struct {
-	ID     string
-	Images []Image
-}
-
-func (a Attachments) WriteToCSV(writer *csv.Writer) error {
-	var errors []string
-
-	for _, img := range a.Images {
-		if err := writer.Write([]string{a.ID, img.Name}); err != nil {
-			errors = append(errors, fmt.Sprintf("post %s image %s: %s\n", a.ID, img.Name, err.Error()))
-		}
-	}
-
-	if len(errors) > 0 {
-		return fmt.Errorf(strings.Join(errors, "\n"))
-	}
-
-	return nil
-}
-
-type Post struct {
-	ID       string
-	Location string
-	Content  string
-	Images   []Image
-}
-
-func (p Post) WriteToCSV(writer *csv.Writer) error {
-	return writer.Write([]string{
-		p.ID,
-		fmt.Sprintf("%s", p.Location),
-		fmt.Sprintf("%s", strings.ReplaceAll(p.Content, `"`, `'`)),
-	})
-}
 
 func main() {
 	// TODO: Priority 4: Add a way to pass the following as command line arguments
@@ -125,7 +56,7 @@ func main() {
 	wg.Add(workers.MaxWorkers)
 	for i := 1; i <= workers.MaxWorkers-2; i++ {
 		go workers.FileDownload(workers.LogOnError, &wg, imgDownloadChan, func(d workers.Downloader) string {
-			return filepath.Join(imagesDir, d.(Image).Name)
+			return filepath.Join(imagesDir, d.(models.Image).Name)
 		})
 	}
 
@@ -192,7 +123,7 @@ func main() {
 			}
 
 			postChan <- post
-			attachmentsChan <- Attachments{ID: post.ID, Images: post.Images}
+			attachmentsChan <- models.Attachments{ID: post.ID, Images: post.Images}
 
 			for _, img := range post.Images {
 				imgDownloadChan <- img
@@ -216,7 +147,7 @@ func main() {
 	wg.Wait()
 }
 
-func extractPost(postNode *cdp.Node, ctx context.Context) (*Post, error) {
+func extractPost(postNode *cdp.Node, ctx context.Context) (*models.Post, error) {
 	var aNodes, imageNodes []*cdp.Node
 	var content, location string
 
@@ -245,11 +176,11 @@ func extractPost(postNode *cdp.Node, ctx context.Context) (*Post, error) {
 		}
 	}
 
-	post := &Post{
+	post := &models.Post{
 		ID:       strings.TrimPrefix(strings.TrimPrefix(postUrl.Query().Get("set"), "pcb."), "gm."),
 		Location: location,
 		Content:  content,
-		Images:   make([]Image, 0, len(imageNodes)),
+		Images:   make([]models.Image, 0, len(imageNodes)),
 	}
 
 	for _, img := range imageNodes {
@@ -258,7 +189,7 @@ func extractPost(postNode *cdp.Node, ctx context.Context) (*Post, error) {
 			continue
 		}
 
-		post.Images = append(post.Images, Image{
+		post.Images = append(post.Images, models.Image{
 			Name: filepath.Base(imgUrl.Path),
 			Url:  img.AttributeValue("src"),
 		})
