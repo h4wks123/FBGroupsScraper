@@ -14,14 +14,14 @@ type Image struct {
 	Url  string
 }
 
-func (img Image) Download(path string) error {
+func (img Image) Download(client *http.Client, path string) error {
 	file, err := os.Create(path)
 	if err != nil {
 		return fmt.Errorf("image %s: %s\n", img.Name, err.Error())
 	}
 	defer file.Close()
 
-	resp, err := http.Get(img.Url)
+	resp, err := client.Get(img.Url)
 	if err != nil {
 		return fmt.Errorf("image %s: %s\n", img.Name, err.Error())
 	}

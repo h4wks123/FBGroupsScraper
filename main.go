@@ -5,6 +5,7 @@ import (
 	"errors"
 	"fmt"
 	"log"
+	"net/http"
 	"net/url"
 	"os"
 	"path/filepath"
@@ -38,6 +39,8 @@ var (
 )
 
 func main() {
+	// flag parsing, and TLS connection for chromedp
+
 	// TODO: Priority 4: Add a way to pass the following as command line arguments
 	// Rate limit to limit the number of parses per second
 	// Output folder to save the images to
@@ -47,16 +50,25 @@ func main() {
 		log.Fatal(err)
 	}
 
-	// Instantiate workers for downloading images, writing posts to csv, and writing attachments to csv
+	// Instead wait group, and channels for concurrency
 	var wg sync.WaitGroup
 
 	imgDownloadChan := make(chan workers.Downloader, 64)
 	postChan := make(chan workers.CSVWriter, 32)
 	attachmentsChan := make(chan workers.CSVWriter, 32)
 
+	// Create a download client, this ensures that TLS connections are reused
+	client := &http.Client{
+		Transport: &http.Transport{
+			// There are MaxWorkers - 2 download workers, we double it for margin
+			MaxIdleConnsPerHost: 2 * (workers.MaxWorkers - 2),
+			IdleConnTimeout:     2 * time.Minute,
+		},
+	}
+
 	wg.Add(workers.MaxWorkers)
 	for i := 1; i <= workers.MaxWorkers-2; i++ {
-		go workers.FileDownload(workers.LogOnError, &wg, imgDownloadChan, func(d workers.Downloader) string {
+		go workers.FileDownload(workers.LogOnError, &wg, imgDownloadChan, client, func(d workers.Downloader) string {
 			return filepath.Join(imagesDir, d.(models.Image).Name)
 		})
 	}
@@ -192,6 +204,9 @@ func extractPost(postNode *cdp.Node, ctx context.Context) (*models.Post, error) 
 		if err != nil {
 			continue
 		}
+
+		log.Printf("%s", imgUrl.Host)
+		log.Printf("%s", imgUrl)
 
 		post.Images = append(post.Images, models.Image{
 			Name: filepath.Base(imgUrl.Path),
