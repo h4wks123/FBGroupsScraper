@@ -35,6 +35,7 @@ var (
 	UnableToRetrieve = errors.New("error: unable to retrieve")
 	groupID          string
 	outputDir        string
+	headless         bool
 	timeout          int
 	maxRetries       int
 	maxPosts         int
@@ -43,9 +44,10 @@ var (
 func init() {
 	flag.StringVar(&groupID, "groupID", "900072927547214", "Facebook Group ID to scrape")
 	flag.StringVar(&outputDir, "output", "results", "Output directory for scraped data")
+	flag.BoolVar(&headless, "headless", false, "Run in headless mode")
 	flag.IntVar(&timeout, "timeout", 5, "Timeout for Each Post Scrape")
 	flag.IntVar(&maxRetries, "retries", 5, "Maximum number of retries for page scrape before giving up")
-	flag.IntVar(&maxPosts, "posts", 10000, "Maximum number of posts to scrape (may be higher than this)")
+	flag.IntVar(&maxPosts, "posts", 10, "Maximum number of posts to scrape (may be higher than this)")
 
 	flag.Usage = func() {
 		fmt.Fprintf(os.Stderr, "Usage: %s [options]\n", os.Args[0])
@@ -86,7 +88,11 @@ func main() {
 	go workers.CSVWrite(workers.LogOnError, &wg, attachmentsChan, filepath.Join(outputDir, attachmentsFile), []string{"post_id", "image"})
 
 	// Open Browser
-	ctx, cancel := chromedp.NewContext(context.Background())
+	browser, cancel := chromedp.NewExecAllocator(context.Background(),
+		append(chromedp.DefaultExecAllocatorOptions[:], chromedp.Flag("headless", headless))...,
+	)
+
+	ctx, cancel := chromedp.NewContext(browser)
 	defer cancel()
 
 	// Retrieve facebook group feed
@@ -120,10 +126,16 @@ func main() {
 				timeoutCtx, cancel := context.WithTimeout(ctx, time.Duration(timeout)*time.Second)
 				defer cancel()
 
-				return chromedp.Nodes(`[aria-posinset][role="article"] div:not([class]):nth-child(3):has(a img[src*="fna.fbcdn.net"])`, &postNodes, chromedp.ByQueryAll, chromedp.FromNode(feed)).Do(timeoutCtx)
+				return chromedp.Nodes(
+					`[aria-posinset][role="article"] div:not([class]):nth-child(3):has(a:is([href*="set=pcb."], [href*="set=gm."]) img[src*="fna.fbcdn.net"])`,
+					&postNodes,
+					chromedp.ByQueryAll,
+					chromedp.FromNode(feed),
+				).Do(timeoutCtx)
 			}),
 		); err != nil {
 			if err == context.DeadlineExceeded {
+				fmt.Printf("Scraping timed out. Retrying (%d / %d)...", retries, maxRetries)
 				retries += 1
 				if err := chromedp.Run(ctx, chromedp.Evaluate(`window.scrollTo(0, document.body.scrollHeight);`, nil)); err != nil {
 					log.Fatal(err)
@@ -132,7 +144,6 @@ func main() {
 				continue
 			}
 
-			// For other errors stop the program
 			log.Fatal(err)
 		}
 
@@ -161,9 +172,15 @@ func main() {
 
 		retries = 0
 		log.Printf("Scraped %d posts...\n", postsScraped)
+		postNodes = postNodes[:0]
+	}
+
+	if postsScraped == maxPosts {
+		log.Println("Max retries reached.")
 	}
 
 	// Close channels and wait for the workers to finish
+	log.Println("Waiting for other threads to finish...")
 	close(imgDownloadChan)
 	close(postChan)
 	close(attachmentsChan)
@@ -180,7 +197,7 @@ func extractPost(postNode *cdp.Node, ctx context.Context) (*models.Post, error) 
 		// Get Post Content
 		chromedp.Evaluate(scripts.ExtractAllText(postNode.FullXPath(), "[data-ad-preview='message']"), &content),
 		// Get Post Image Links
-		chromedp.Nodes(`a[role="link"]:has(img)`, &aNodes, chromedp.ByQueryAll, chromedp.FromNode(postNode)),
+		chromedp.Nodes(`a[role="link"]:is([href*="set=pcb."], [href*="set=gm."]):has(img)`, &aNodes, chromedp.ByQueryAll, chromedp.FromNode(postNode)),
 		// Get Post Images
 		chromedp.Nodes(`img[src*="fna.fbcdn.net"]`, &imageNodes, chromedp.ByQueryAll, chromedp.FromNode(postNode)),
 	); err != nil {
