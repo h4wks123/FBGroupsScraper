@@ -47,6 +47,7 @@ func main() {
 		log.Fatal(err)
 	}
 
+	// Instantiate workers for downloading images, writing posts to csv, and writing attachments to csv
 	var wg sync.WaitGroup
 
 	imgDownloadChan := make(chan workers.Downloader, 64)
@@ -59,40 +60,40 @@ func main() {
 			return filepath.Join(imagesDir, d.(models.Image).Name)
 		})
 	}
-
 	go workers.CSVWrite(workers.LogOnError, &wg, postChan, postsFile, []string{"post_id", "location", "content"})
 	go workers.CSVWrite(workers.LogOnError, &wg, attachmentsChan, attachmentsFile, []string{"post_id", "image"})
 
-	opts := append(chromedp.DefaultExecAllocatorOptions[:], chromedp.Flag("headless", false))
-	browser, cancel := chromedp.NewExecAllocator(context.Background(), opts...)
+	// Open Browser
+	ctx, cancel := chromedp.NewContext(context.Background())
 	defer cancel()
 
-	ctx, cancel := chromedp.NewContext(browser)
-	defer cancel()
-
-	log.Println("Retrieving facebook group...")
+	// Retrieve facebook group feed
+	log.Println("Retrieving facebook group feed...")
 	feed, err := getFacebookGroupFeed(ctx, groupID)
 	if err != nil {
 		log.Fatal(err)
 	}
 
+	// Load scripts, and track feed for stability used for polling it for new loaded posts
+	log.Println("Tracking facebook group feed...")
 	if err := chromedp.Run(ctx,
-		loadScripts(scripts.All()...),
-		// Track the feed for stability (i.e., no changes have occured to its children after a period of time)
+		chromedp.Evaluate(strings.Join(scripts.All(), "\n\n"), nil),
 		chromedp.Evaluate(scripts.TrackStability(feed.FullXPath(), "feed", time.Second), nil),
 	); err != nil {
 		log.Fatal(err)
 	}
 
-	log.Println("Retrieving posts...")
+	// Main Scraping Logic
+	log.Println("Scraping facebook group feed...")
 	var retries, postsScraped int
 	var postNodes []*cdp.Node
 	for postsScraped < maxPosts {
 		if err := chromedp.Run(ctx,
+			// Check if the feed is stable (i.e., no more changes have occurred to its children)
 			chromedp.Poll(scripts.CheckStability("feed"), nil),
-			// Expand all content
+			// Expand all See More... Content
 			chromedp.Evaluate(`document.querySelectorAll('[data-ad-preview="message"] div:last-child[role="button"]').forEach((n)=> n.click())`, nil),
-			// Retrieve the posts that have images
+			// Retrieve the posts that have images on a timeout
 			chromedp.ActionFunc(func(ctx context.Context) error {
 				timeoutCtx, cancel := context.WithTimeout(ctx, timeout*time.Second)
 				defer cancel()
@@ -100,25 +101,27 @@ func main() {
 				return chromedp.Nodes(`[aria-posinset][role="article"] div:not([class]):nth-child(3):has(a img[src*="fna.fbcdn.net"])`, &postNodes, chromedp.ByQueryAll, chromedp.FromNode(feed)).Do(timeoutCtx)
 			}),
 		); err != nil {
-			if err != context.DeadlineExceeded || retries >= maxRetries {
-				log.Fatal(err)
+			// Try to retry if the context deadline was exceeded, and the max number of retries has not been reached
+			if err == context.DeadlineExceeded && retries < maxRetries {
+				retries = retries + 1
+				if err := chromedp.Run(ctx,
+					chromedp.Evaluate(`window.scrollTo(0, document.body.scrollHeight);`, nil),
+				); err != nil {
+					log.Fatal(err)
+				}
+
+				continue
 			}
 
-			retries = retries + 1
-			if err := chromedp.Run(ctx, chromedp.Evaluate(`window.scrollTo(0, document.body.scrollHeight);`, nil)); err != nil {
-				log.Fatal(err)
-			}
-
-			continue
+			// For other errors stop the program
+			log.Fatal(err)
 		}
 
-		// create a channel, to receive the image links, and then delegate it to goroutines, so it runs in the background
 		postsScraped += len(postNodes)
 		for _, postNode := range postNodes {
 			post, err := extractPost(postNode, ctx)
 			if err != nil {
 				postsScraped -= 1
-				log.Println(err)
 				continue
 			}
 
@@ -130,20 +133,21 @@ func main() {
 			}
 		}
 
-		retries = 0
+		// Remove the posts that have been processed
 		if err := chromedp.Run(ctx,
-			// Remove the posts that have been processed
 			chromedp.Evaluate(`document.querySelectorAll('[data-pagelet="GroupFeed"] > [role="feed"] > div:nth-last-child(n+4)').forEach((n) => n.remove());`, nil),
 		); err != nil {
 			log.Fatal(err)
 		}
 
-		log.Printf("Scraped %d posts\n", postsScraped)
+		retries = 0
+		log.Printf("Scraped %d posts...\n", postsScraped)
 	}
 
 	close(imgDownloadChan)
 	close(postChan)
 	close(attachmentsChan)
+
 	wg.Wait()
 }
 
@@ -196,16 +200,6 @@ func extractPost(postNode *cdp.Node, ctx context.Context) (*models.Post, error) 
 	}
 
 	return post, nil
-}
-
-func loadScripts(scripts ...string) chromedp.ActionFunc {
-	return func(ctx context.Context) error {
-		if err := chromedp.Run(ctx, chromedp.Evaluate(strings.Join(scripts, "\n"), nil)); err != nil {
-			return err
-		}
-
-		return nil
-	}
 }
 
 func navigateWithBypass(url string, sleep time.Duration, retries int) chromedp.ActionFunc {
