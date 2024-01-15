@@ -12,12 +12,12 @@ import (
 	"os"
 	"path/filepath"
 	"regexp"
-	"runtime"
 	"strings"
 	"sync"
 	"time"
 
 	"github.com/LaplaceXD/FBGroupsScraper/scripts"
+	"github.com/LaplaceXD/FBGroupsScraper/workers"
 	"github.com/chromedp/cdproto/cdp"
 	"github.com/chromedp/chromedp"
 )
@@ -45,26 +45,47 @@ type Image struct {
 	Url  string
 }
 
-func (image Image) Download(path string) error {
+func (img Image) Download(path string) error {
 	file, err := os.Create(path)
 	if err != nil {
-		return fmt.Errorf("image %s: %s\n", image.Name, err.Error())
+		return fmt.Errorf("image %s: %s\n", img.Name, err.Error())
 	}
 	defer file.Close()
 
-	resp, err := http.Get(image.Url)
+	resp, err := http.Get(img.Url)
 	if err != nil {
-		return fmt.Errorf("image %s: %s\n", image.Name, err.Error())
+		return fmt.Errorf("image %s: %s\n", img.Name, err.Error())
 	}
 	defer resp.Body.Close()
 
 	if resp.StatusCode != http.StatusOK {
-		return fmt.Errorf("image %s: %s\n", image.Name, UnableToDownload.Error())
+		return fmt.Errorf("image %s: %s\n", img.Name, UnableToDownload.Error())
 	}
 
 	_, err = io.Copy(file, resp.Body)
 	if err != nil {
-		return fmt.Errorf("image %s: %s\n", image.Name, err.Error())
+		return fmt.Errorf("image %s: %s\n", img.Name, err.Error())
+	}
+
+	return nil
+}
+
+type Attachments struct {
+	ID     string
+	Images []Image
+}
+
+func (a Attachments) WriteToCSV(writer *csv.Writer) error {
+	var errors []string
+
+	for _, img := range a.Images {
+		if err := writer.Write([]string{a.ID, img.Name}); err != nil {
+			errors = append(errors, fmt.Sprintf("post %s image %s: %s\n", a.ID, img.Name, err.Error()))
+		}
+	}
+
+	if len(errors) > 0 {
+		return fmt.Errorf(strings.Join(errors, "\n"))
 	}
 
 	return nil
@@ -77,85 +98,39 @@ type Post struct {
 	Images   []Image
 }
 
+func (p Post) WriteToCSV(writer *csv.Writer) error {
+	return writer.Write([]string{
+		p.ID,
+		fmt.Sprintf("%s", p.Location),
+		fmt.Sprintf("%s", strings.ReplaceAll(p.Content, `"`, `'`)),
+	})
+}
+
 func main() {
 	// TODO: Priority 4: Add a way to pass the following as command line arguments
 	// Rate limit to limit the number of parses per second
 	// Output folder to save the images to
 	// Filenames for the csvs
-	var wg sync.WaitGroup
-	imgChan := make(chan Image, 64)
-	postChan := make(chan *Post, 32)
-	postReplicaChan := make(chan *Post, 32)
 
 	if err := os.MkdirAll(imagesDir, os.ModePerm); err != nil {
 		log.Fatal(err)
 	}
 
-	for i := 1; i <= runtime.GOMAXPROCS(0)-3; i++ {
-		wg.Add(1)
-		go func(imgs <-chan Image, wg *sync.WaitGroup) {
-			defer wg.Done()
+	var wg sync.WaitGroup
 
-			for img := range imgs {
-				if err := img.Download(filepath.Join(imagesDir, img.Name)); err != nil {
-					log.Println(err)
-					continue
-				}
-			}
-		}(imgChan, &wg)
+	imgDownloadChan := make(chan workers.Downloader, 64)
+	postChan := make(chan workers.CSVWriter, 32)
+	attachmentsChan := make(chan workers.CSVWriter, 32)
+
+	wg.Add(workers.MaxWorkers)
+	for i := 1; i <= workers.MaxWorkers-2; i++ {
+		go workers.FileDownload(workers.LogOnError, &wg, imgDownloadChan, func(d workers.Downloader) string {
+			return filepath.Join(imagesDir, d.(Image).Name)
+		})
 	}
 
-	wg.Add(1)
-	go func(posts <-chan *Post, wg *sync.WaitGroup) {
-		defer wg.Done()
-
-		file, err := os.Create(postsFile)
-		if err != nil {
-			log.Fatal(err)
-		}
-		defer file.Close()
-
-		postWriter := csv.NewWriter(file)
-		defer postWriter.Flush()
-
-		if err := postWriter.Write([]string{"id", "location", "content"}); err != nil {
-			log.Fatal(err)
-		}
-
-		for post := range postChan {
-			if err := postWriter.Write([]string{post.ID, fmt.Sprintf("%s", post.Location), fmt.Sprintf("%s", strings.ReplaceAll(post.Content, `"`, `'`))}); err != nil {
-				log.Println(err)
-				continue
-			}
-		}
-	}(postChan, &wg)
-
-	wg.Add(1)
-	go func(posts <-chan *Post, wg *sync.WaitGroup) {
-		defer wg.Done()
-
-		file, err := os.Create(attachmentsFile)
-		if err != nil {
-			log.Fatal(err)
-		}
-		defer file.Close()
-
-		attachmentsWriter := csv.NewWriter(file)
-		defer attachmentsWriter.Flush()
-
-		if err := attachmentsWriter.Write([]string{"id", "image"}); err != nil {
-			log.Fatal(err)
-		}
-
-		for post := range posts {
-			for _, img := range post.Images {
-				if err := attachmentsWriter.Write([]string{post.ID, img.Name}); err != nil {
-					log.Println(err)
-					continue
-				}
-			}
-		}
-	}(postReplicaChan, &wg)
+	go workers.CSVWrite(workers.LogOnError, &wg, postChan, postsFile, []string{"post_id", "location", "content"})
+	go workers.CSVWrite(workers.LogOnError, &wg, attachmentsChan, attachmentsFile, []string{"post_id", "image"})
 
 	opts := append(chromedp.DefaultExecAllocatorOptions[:], chromedp.Flag("headless", false))
 	browser, cancel := chromedp.NewExecAllocator(context.Background(), opts...)
@@ -217,10 +192,10 @@ func main() {
 			}
 
 			postChan <- post
-			postReplicaChan <- post
+			attachmentsChan <- Attachments{ID: post.ID, Images: post.Images}
 
 			for _, img := range post.Images {
-				imgChan <- img
+				imgDownloadChan <- img
 			}
 		}
 
@@ -235,9 +210,9 @@ func main() {
 		log.Printf("Scraped %d posts\n", postsScraped)
 	}
 
-	close(imgChan)
+	close(imgDownloadChan)
 	close(postChan)
-	close(postReplicaChan)
+	close(attachmentsChan)
 	wg.Wait()
 }
 
