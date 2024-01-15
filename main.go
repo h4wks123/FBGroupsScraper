@@ -65,9 +65,9 @@ func main() {
 	// Instead wait group, and channels for concurrency
 	var wg sync.WaitGroup
 
-	imgDownloadChan := make(chan workers.Downloader, 1024)
-	postChan := make(chan workers.CSVWriter, 256)
-	attachmentsChan := make(chan workers.CSVWriter, 256)
+	imgDownloadChan := make(chan workers.Downloader, 128)
+	postChan := make(chan workers.CSVWriter, 64)
+	attachmentsChan := make(chan workers.CSVWriter, 64)
 
 	// Create a download client, this ensures that TLS connections are reused
 	client := &http.Client{
@@ -106,7 +106,7 @@ func main() {
 	log.Println("Tracking facebook group feed...")
 	if err := chromedp.Run(ctx,
 		chromedp.Evaluate(strings.Join(scripts.All(), "\n\n"), nil),
-		chromedp.Evaluate(scripts.TrackStability(feed.FullXPath(), "feed", time.Second), nil),
+		chromedp.Evaluate(scripts.TrackStability(feed.FullXPath(), "feed", 2*time.Second), nil),
 	); err != nil {
 		log.Fatal(err)
 	}
@@ -117,8 +117,10 @@ func main() {
 	var postNodes []*cdp.Node
 	for postsScraped < maxPosts && retries < maxRetries {
 		if err := chromedp.Run(ctx,
-			// Check if the feed is stable (i.e., no more changes have occurred to its children)
-			chromedp.Poll(scripts.CheckStability("feed"), nil),
+			// Let the page load naturally first
+			chromedp.Sleep(3*time.Second),
+			// Then, check if the feed is stable (i.e., no more changes have occurred to its children)
+			chromedp.Poll(scripts.CheckStability("feed"), nil, chromedp.WithPollingInterval(time.Second)),
 			// Expand all See More... Content
 			chromedp.Evaluate(`document.querySelectorAll('[data-ad-preview="message"] div:last-child[role="button"]').forEach((n)=> n.click())`, nil),
 			// Retrieve the posts that have images on a timeout
