@@ -63,9 +63,9 @@ func main() {
 	// Instead wait group, and channels for concurrency
 	var wg sync.WaitGroup
 
-	imgDownloadChan := make(chan workers.Downloader, 64)
-	postChan := make(chan workers.CSVWriter, 32)
-	attachmentsChan := make(chan workers.CSVWriter, 32)
+	imgDownloadChan := make(chan workers.Downloader, 1024)
+	postChan := make(chan workers.CSVWriter, 256)
+	attachmentsChan := make(chan workers.CSVWriter, 256)
 
 	// Create a download client, this ensures that TLS connections are reused
 	client := &http.Client{
