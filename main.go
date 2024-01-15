@@ -3,6 +3,7 @@ package main
 import (
 	"context"
 	"errors"
+	"flag"
 	"fmt"
 	"log"
 	"net/http"
@@ -23,30 +24,39 @@ import (
 
 const (
 	endpoint        = `https://www.facebook.com/groups`
-	groupID         = `900072927547214`
 	postsFile       = "posts.csv"
 	attachmentsFile = "attachments.csv"
 	imagesDir       = "images"
-	timeout         = 5
-	maxRetries      = 5
-	maxPosts        = 30 // this is just a min bound, the actual number of posts scraped may be higher than this
 )
 
 var (
 	locationRegex    = regexp.MustCompile(`(?i)loc(?:ation)?(?:.*?)([^ation]\w[\w\ \,]+)`)
 	BypassFailed     = errors.New("error: unable to bypass redirect")
 	UnableToRetrieve = errors.New("error: unable to retrieve")
+	groupID          string
+	outputDir        string
+	timeout          int
+	maxRetries       int
+	maxPosts         int
 )
 
+func init() {
+	flag.StringVar(&groupID, "groupID", "900072927547214", "Facebook Group ID to scrape")
+	flag.StringVar(&outputDir, "output", "results", "Output directory for scraped data")
+	flag.IntVar(&timeout, "timeout", 5, "Timeout for Each Post Scrape")
+	flag.IntVar(&maxRetries, "retries", 5, "Maximum number of retries for page scrape before giving up")
+	flag.IntVar(&maxPosts, "posts", 10000, "Maximum number of posts to scrape (may be higher than this)")
+
+	flag.Usage = func() {
+		fmt.Fprintf(os.Stderr, "Usage: %s [options]\n", os.Args[0])
+		flag.PrintDefaults()
+	}
+}
+
 func main() {
-	// flag parsing, and TLS connection for chromedp
+	flag.Parse()
 
-	// TODO: Priority 4: Add a way to pass the following as command line arguments
-	// Rate limit to limit the number of parses per second
-	// Output folder to save the images to
-	// Filenames for the csvs
-
-	if err := os.MkdirAll(imagesDir, os.ModePerm); err != nil {
+	if err := os.MkdirAll(filepath.Join(outputDir, imagesDir), os.ModePerm); err != nil {
 		log.Fatal(err)
 	}
 
@@ -69,11 +79,11 @@ func main() {
 	wg.Add(workers.MaxWorkers)
 	for i := 1; i <= workers.MaxWorkers-2; i++ {
 		go workers.FileDownload(workers.LogOnError, &wg, imgDownloadChan, client, func(d workers.Downloader) string {
-			return filepath.Join(imagesDir, d.(models.Image).Name)
+			return filepath.Join(outputDir, imagesDir, d.(models.Image).Name)
 		})
 	}
-	go workers.CSVWrite(workers.LogOnError, &wg, postChan, postsFile, []string{"post_id", "location", "content"})
-	go workers.CSVWrite(workers.LogOnError, &wg, attachmentsChan, attachmentsFile, []string{"post_id", "image"})
+	go workers.CSVWrite(workers.LogOnError, &wg, postChan, filepath.Join(outputDir, postsFile), []string{"post_id", "location", "content"})
+	go workers.CSVWrite(workers.LogOnError, &wg, attachmentsChan, filepath.Join(outputDir, attachmentsFile), []string{"post_id", "image"})
 
 	// Open Browser
 	ctx, cancel := chromedp.NewContext(context.Background())
@@ -99,7 +109,7 @@ func main() {
 	log.Println("Scraping facebook group feed...")
 	var retries, postsScraped int
 	var postNodes []*cdp.Node
-	for postsScraped < maxPosts {
+	for postsScraped < maxPosts && retries < maxRetries {
 		if err := chromedp.Run(ctx,
 			// Check if the feed is stable (i.e., no more changes have occurred to its children)
 			chromedp.Poll(scripts.CheckStability("feed"), nil),
@@ -107,18 +117,15 @@ func main() {
 			chromedp.Evaluate(`document.querySelectorAll('[data-ad-preview="message"] div:last-child[role="button"]').forEach((n)=> n.click())`, nil),
 			// Retrieve the posts that have images on a timeout
 			chromedp.ActionFunc(func(ctx context.Context) error {
-				timeoutCtx, cancel := context.WithTimeout(ctx, timeout*time.Second)
+				timeoutCtx, cancel := context.WithTimeout(ctx, time.Duration(timeout)*time.Second)
 				defer cancel()
 
 				return chromedp.Nodes(`[aria-posinset][role="article"] div:not([class]):nth-child(3):has(a img[src*="fna.fbcdn.net"])`, &postNodes, chromedp.ByQueryAll, chromedp.FromNode(feed)).Do(timeoutCtx)
 			}),
 		); err != nil {
-			// Try to retry if the context deadline was exceeded, and the max number of retries has not been reached
-			if err == context.DeadlineExceeded && retries < maxRetries {
-				retries = retries + 1
-				if err := chromedp.Run(ctx,
-					chromedp.Evaluate(`window.scrollTo(0, document.body.scrollHeight);`, nil),
-				); err != nil {
+			if err == context.DeadlineExceeded {
+				retries += 1
+				if err := chromedp.Run(ctx, chromedp.Evaluate(`window.scrollTo(0, document.body.scrollHeight);`, nil)); err != nil {
 					log.Fatal(err)
 				}
 
@@ -156,11 +163,13 @@ func main() {
 		log.Printf("Scraped %d posts...\n", postsScraped)
 	}
 
+	// Close channels and wait for the workers to finish
 	close(imgDownloadChan)
 	close(postChan)
 	close(attachmentsChan)
-
 	wg.Wait()
+
+	log.Printf("Done! %d posts scraped.", postsScraped)
 }
 
 func extractPost(postNode *cdp.Node, ctx context.Context) (*models.Post, error) {
@@ -204,9 +213,6 @@ func extractPost(postNode *cdp.Node, ctx context.Context) (*models.Post, error) 
 		if err != nil {
 			continue
 		}
-
-		log.Printf("%s", imgUrl.Host)
-		log.Printf("%s", imgUrl)
 
 		post.Images = append(post.Images, models.Image{
 			Name: filepath.Base(imgUrl.Path),
